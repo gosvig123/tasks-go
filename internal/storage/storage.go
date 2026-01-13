@@ -263,6 +263,28 @@ func (s *Storage) GetListInfo(name string) (*ListInfo, error) {
 	}, nil
 }
 
+// GetListInfoFast returns basic counts without full parsing (for starship)
+func (s *Storage) GetListInfoFast(name string) (completed, total int) {
+	path := s.ListPath(name)
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, 0
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "[x] ") || strings.HasPrefix(line, "[X] ") {
+			completed++
+			total++
+		} else if strings.HasPrefix(line, "[ ] ") || strings.HasPrefix(line, "[] ") {
+			total++
+		}
+	}
+	return completed, total
+}
+
 // GetAllListInfo returns info about all lists
 func (s *Storage) GetAllListInfo() ([]*ListInfo, error) {
 	lists, err := s.GetAllLists()

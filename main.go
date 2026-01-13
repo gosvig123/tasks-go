@@ -31,6 +31,10 @@ func main() {
 	case "l", "view":
 		runInteractive()
 
+	// List all tasks from all lists (interactive)
+	case "la", "all":
+		runAllInteractive()
+
 	// Plain list (no TUI)
 	case "lp", "list-plain":
 		listPlain()
@@ -41,7 +45,12 @@ func main() {
 			fmt.Println("Usage: tasks add 'task content'")
 			os.Exit(1)
 		}
-		addTask(strings.Join(args, " "))
+		// Special case: "add today" populates today's list with due tasks
+		if args[0] == "today" && len(args) == 1 {
+			addToday()
+		} else {
+			addTask(strings.Join(args, " "))
+		}
 
 	// Delete task
 	case "d", "delete":
@@ -75,6 +84,10 @@ func main() {
 	case "starship":
 		starshipOutput()
 
+	// Debug: show raw completion status
+	case "debug":
+		debugAllTasks()
+
 	// Help
 	case "help", "-h", "--help":
 		showHelp()
@@ -96,6 +109,13 @@ func runInteractive() {
 	}
 
 	if err := ui.RunTaskList(store); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runAllInteractive() {
+	if err := ui.RunAllTasks(store); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -145,6 +165,70 @@ func listPlain() {
 	}
 }
 
+func listAll() {
+	lists, err := store.GetAllLists()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting lists: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Reset today's list if it exists
+	store.ResetTodayList()
+
+	currentList := store.GetCurrentList()
+	totalTasks := 0
+	totalCompleted := 0
+
+	fmt.Println("📋 All Tasks from All Lists")
+	fmt.Println()
+
+	for _, listName := range lists {
+		list, err := store.LoadList(listName)
+		if err != nil {
+			continue
+		}
+
+		if list.Len() == 0 {
+			continue
+		}
+
+		marker := ""
+		if listName == currentList {
+			marker = " *"
+		}
+
+		completed := list.CompletedCount()
+		total := list.Len()
+		totalTasks += total
+		totalCompleted += completed
+
+		fmt.Printf("── %s (%d/%d)%s ──\n", listName, completed, total, marker)
+
+		tasks := list.SortedTasks()
+		for i, t := range tasks {
+			check := "[]"
+			if t.Completed {
+				check = "[x]"
+			}
+
+			due := ""
+			if t.DueDate != nil {
+				due = fmt.Sprintf(" (due: %s)", t.DueDate.Format("2006-01-02"))
+			}
+
+			recur := ""
+			if t.RecurDays > 0 {
+				recur = fmt.Sprintf(" 🔁%dd", t.RecurDays)
+			}
+
+			fmt.Printf("  %d/%d. %s %s%s%s\n", i+1, total, check, t.DisplayContent(), due, recur)
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("Total: %d/%d tasks completed\n", totalCompleted, totalTasks)
+}
+
 func addTask(content string) {
 	currentList := store.GetCurrentList()
 	list, err := store.LoadList(currentList)
@@ -182,6 +266,20 @@ func addTask(content string) {
 	}
 
 	fmt.Printf("✅ Added to '%s': %s\n", currentList, displayContent)
+}
+
+func addToday() {
+	// First, auto-add due tasks
+	added, _ := store.ResetTodayList()
+	if added > 0 {
+		fmt.Printf("📅 Auto-added %d due task(s) to today's list\n", added)
+	}
+
+	// Then show interactive picker for manual selection
+	if _, err := ui.RunAddToday(store); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func deleteTask(indexStr string) {
@@ -299,7 +397,19 @@ func syncToSource(todayTask *task.Task) {
 
 func handleListCommand(args []string) {
 	if len(args) == 0 {
-		showLists()
+		// Interactive list selector, then open task view
+		selected, err := ui.RunListSwitcher(store)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		// If a list was selected, open the task view
+		if selected != "" {
+			if err := ui.RunTaskList(store); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		}
 		return
 	}
 
@@ -307,7 +417,7 @@ func handleListCommand(args []string) {
 	subargs := args[1:]
 
 	switch subcmd {
-	case "show", "":
+	case "show", "p", "plain":
 		showLists()
 
 	case "a", "add", "create", "c":
@@ -473,13 +583,56 @@ func renameList(oldName, newName string) {
 
 func starshipOutput() {
 	currentList := store.GetCurrentList()
-	info, err := store.GetListInfo(currentList)
-	if err != nil {
-		fmt.Print(currentList)
-		return
+	completed, total := store.GetListInfoFast(currentList)
+	fmt.Printf("%s(%d/%d)", currentList, completed, total)
+}
+
+func debugAllTasks() {
+	lists, _ := store.GetAllLists()
+
+	uncompleted := 0
+	completed := 0
+
+	for _, listName := range lists {
+		list, err := store.LoadList(listName)
+		if err != nil {
+			continue
+		}
+
+		for _, t := range list.Tasks {
+			if t.Completed {
+				completed++
+			} else {
+				uncompleted++
+			}
+		}
 	}
 
-	fmt.Printf("%s(%d/%d)", currentList, info.Completed, info.Total)
+	fmt.Printf("=== DEBUG ===\n")
+	fmt.Printf("Uncompleted: %d\n", uncompleted)
+	fmt.Printf("Completed: %d\n", completed)
+	fmt.Printf("Total: %d\n", uncompleted+completed)
+	fmt.Println()
+
+	// Show first 10 uncompleted
+	fmt.Println("First 10 uncompleted:")
+	count := 0
+	for _, listName := range lists {
+		list, _ := store.LoadList(listName)
+		for _, t := range list.Tasks {
+			if !t.Completed && count < 10 {
+				fmt.Printf("  [%s] %s\n", listName, t.Content[:min(40, len(t.Content))])
+				count++
+			}
+		}
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func parseIndices(s string) []int {
@@ -525,10 +678,12 @@ func showHelp() {
 
 	fmt.Println("Task Commands:")
 	fmt.Println("  tasks l|view              - Interactive task list (TUI)")
+	fmt.Println("  tasks la|all              - Show all tasks from all lists")
 	fmt.Println("  tasks lp|list-plain       - Plain text task list")
 	fmt.Println("  tasks a|add 'task'        - Add task")
 	fmt.Println("  tasks a|add 'task +N'     - Add task with due date N days from now")
 	fmt.Println("  tasks a|add 'task +Nr'    - Add recurring task every N days")
+	fmt.Println("  tasks add today           - Populate today's list with due tasks")
 	fmt.Println("  tasks d|delete <#>        - Delete task by index")
 	fmt.Println("  tasks t|toggle <#>        - Toggle task completion")
 	fmt.Println()
@@ -545,9 +700,10 @@ func showHelp() {
 	fmt.Println()
 	fmt.Println("Interactive Controls:")
 	fmt.Println("  ↑/↓ or j/k  - Navigate")
-	fmt.Println("  Enter/Space - Toggle task")
+	fmt.Println("  Tab/Enter   - Toggle task")
 	fmt.Println("  a           - Add task")
 	fmt.Println("  d           - Delete task")
+	fmt.Println("  /           - Search tasks")
 	fmt.Println("  L           - Switch list")
 	fmt.Println("  q/Esc       - Quit")
 }

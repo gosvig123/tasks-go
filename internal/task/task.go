@@ -35,9 +35,13 @@ func Parse(line string) (*Task, error) {
 	task := &Task{}
 
 	// Check completion status
-	if strings.HasPrefix(line, "[x] ") {
+	if strings.HasPrefix(line, "[x] ") || strings.HasPrefix(line, "[X] ") {
 		task.Completed = true
 		line = strings.TrimPrefix(line, "[x] ")
+		line = strings.TrimPrefix(line, "[X] ")
+	} else if strings.HasPrefix(line, "[ ] ") {
+		task.Completed = false
+		line = strings.TrimPrefix(line, "[ ] ")
 	} else if strings.HasPrefix(line, "[] ") {
 		task.Completed = false
 		line = strings.TrimPrefix(line, "[] ")
