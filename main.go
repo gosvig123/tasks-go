@@ -3,10 +3,12 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/krisitan/tasks-go/internal/gist"
 	"github.com/krisitan/tasks-go/internal/storage"
 	"github.com/krisitan/tasks-go/internal/task"
 	"github.com/krisitan/tasks-go/internal/ui"
@@ -87,6 +89,10 @@ func main() {
 	// Debug: show raw completion status
 	case "debug":
 		debugAllTasks()
+
+	// Sync to GitHub Gist
+	case "sync":
+		handleSyncCommand(args)
 
 	// Help
 	case "help", "-h", "--help":
@@ -276,9 +282,19 @@ func addToday() {
 	}
 
 	// Then show interactive picker for manual selection
-	if _, err := ui.RunAddToday(store); err != nil {
+	pickerAdded, err := ui.RunAddToday(store)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+
+	// If tasks were added, switch to today list and open task view
+	if pickerAdded > 0 {
+		store.SetCurrentList("today")
+		if err := ui.RunTaskList(store); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -672,6 +688,170 @@ func parseIndices(s string) []int {
 	return indices
 }
 
+func handleSyncCommand(args []string) {
+	client := gist.NewClient()
+
+	if len(args) == 0 {
+		// Default: sync to gist
+		if !client.IsConfigured() {
+			fmt.Println("Gist sync not configured.")
+			fmt.Println("Run 'tasks sync init <github-token>' to set up.")
+			fmt.Println()
+			fmt.Println("To create a token:")
+			fmt.Println("  1. Go to https://github.com/settings/tokens")
+			fmt.Println("  2. Generate new token (classic)")
+			fmt.Println("  3. Select 'gist' scope only")
+			os.Exit(1)
+		}
+
+		fmt.Println("Syncing tasks to GitHub Gist...")
+		g, err := client.Sync(store.TasksDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Sync failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Synced to: %s\n", g.HTMLURL)
+		return
+	}
+
+	subcmd := args[0]
+	subargs := args[1:]
+
+	switch subcmd {
+	case "init":
+		if len(subargs) == 0 {
+			fmt.Println("Usage: tasks sync init <github-token>")
+			fmt.Println()
+			fmt.Println("To create a token:")
+			fmt.Println("  1. Go to https://github.com/settings/tokens")
+			fmt.Println("  2. Generate new token (classic)")
+			fmt.Println("  3. Select 'gist' scope only")
+			os.Exit(1)
+		}
+
+		token := subargs[0]
+		fmt.Println("Initializing gist backup...")
+
+		g, err := client.Init(token, store.TasksDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to initialize: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Println("Gist backup initialized!")
+		fmt.Printf("Gist URL: %s\n", g.HTMLURL)
+		fmt.Println()
+		fmt.Println("To set up daily sync at noon, run:")
+		fmt.Println("  tasks sync schedule")
+
+	case "status":
+		if !client.IsConfigured() {
+			fmt.Println("Gist sync not configured.")
+			fmt.Println("Run 'tasks sync init <github-token>' to set up.")
+			os.Exit(1)
+		}
+
+		g, err := client.Status()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to get status: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Println("Gist Sync Status")
+		fmt.Println()
+		fmt.Printf("  URL:     %s\n", g.HTMLURL)
+		fmt.Printf("  Updated: %s\n", g.UpdatedAt)
+		fmt.Printf("  Files:   %d\n", len(g.Files))
+
+	case "schedule":
+		setupSchedule()
+
+	default:
+		fmt.Printf("Unknown sync command: %s\n", subcmd)
+		os.Exit(1)
+	}
+}
+
+func setupSchedule() {
+	home, _ := os.UserHomeDir()
+	plistPath := home + "/Library/LaunchAgents/com.tasks-go.sync.plist"
+
+	// Find the tasks binary
+	tasksPath, err := os.Executable()
+	if err != nil {
+		// Fallback to common locations
+		if _, err := os.Stat("/usr/local/bin/tasks"); err == nil {
+			tasksPath = "/usr/local/bin/tasks"
+		} else {
+			tasksPath = home + "/go/bin/tasks"
+		}
+	}
+
+	plistContent := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tasks-go.sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>%s</string>
+        <string>sync</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>12</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>%s/.tasks-sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>%s/.tasks-sync.log</string>
+</dict>
+</plist>
+`, tasksPath, home, home)
+
+	// Ensure LaunchAgents directory exists
+	os.MkdirAll(home+"/Library/LaunchAgents", 0755)
+
+	if err := os.WriteFile(plistPath, []byte(plistContent), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create launch agent: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Unload if already loaded, then load
+	os.Setenv("HOME", home)
+	fmt.Println("Installing daily sync schedule (12:00 PM)...")
+
+	// Try to unload first (ignore errors if not loaded)
+	unloadCmd := fmt.Sprintf("launchctl unload '%s' 2>/dev/null; launchctl load '%s'", plistPath, plistPath)
+	if err := runShellCommand(unloadCmd); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load launch agent: %v\n", err)
+		fmt.Println()
+		fmt.Println("Manual installation:")
+		fmt.Printf("  launchctl load '%s'\n", plistPath)
+		os.Exit(1)
+	}
+
+	fmt.Println("Daily sync scheduled!")
+	fmt.Println()
+	fmt.Printf("  Schedule: Every day at 12:00 PM (noon)\n")
+	fmt.Printf("  Log file: %s/.tasks-sync.log\n", home)
+	fmt.Println()
+	fmt.Println("To uninstall:")
+	fmt.Printf("  launchctl unload '%s'\n", plistPath)
+	fmt.Printf("  rm '%s'\n", plistPath)
+}
+
+func runShellCommand(cmd string) error {
+	c := exec.Command("sh", "-c", cmd)
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	return c.Run()
+}
+
 func showHelp() {
 	currentList := store.GetCurrentList()
 	fmt.Printf("Tasks Manager (current list: %s)\n\n", currentList)
@@ -693,6 +873,12 @@ func showHelp() {
 	fmt.Println("  tasks list d|delete <#>   - Delete list")
 	fmt.Println("  tasks list s|switch <#>   - Switch to list")
 	fmt.Println("  tasks list r|rename <#> <new>  - Rename a list")
+	fmt.Println()
+	fmt.Println("Sync Commands:")
+	fmt.Println("  tasks sync                - Sync tasks to GitHub Gist")
+	fmt.Println("  tasks sync init <token>   - Initialize gist backup with GitHub token")
+	fmt.Println("  tasks sync status         - Show sync status")
+	fmt.Println("  tasks sync schedule       - Set up daily sync at 12:00 PM")
 	fmt.Println()
 	fmt.Println("Other:")
 	fmt.Println("  tasks starship            - Output for Starship prompt")

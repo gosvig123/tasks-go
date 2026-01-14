@@ -92,6 +92,10 @@ type TaskViewModel struct {
 	lists      []string
 	listCursor int
 
+	// Terminal size
+	width  int
+	height int
+
 	// State
 	quitting bool
 	added    int // for picker mode: count of added items
@@ -154,6 +158,7 @@ func (m *TaskViewModel) loadSingleList() tea.Msg {
 
 	if listName == "today" {
 		m.storage.ResetTodayList()
+		m.showLists = true // Show source list for today's tasks
 	}
 
 	taskList, err := m.storage.LoadList(listName)
@@ -164,9 +169,14 @@ func (m *TaskViewModel) loadSingleList() tea.Msg {
 	// Separate uncompleted and completed
 	var uncompleted, completed []TaskItem
 	for i, t := range taskList.Tasks {
+		// For today list, use Source as the list name to show origin
+		itemListName := listName
+		if listName == "today" && t.Source != "" {
+			itemListName = t.Source
+		}
 		item := TaskItem{
 			Task:     t,
-			ListName: listName,
+			ListName: itemListName,
 			Index:    i,
 		}
 		if t.Completed {
@@ -280,6 +290,8 @@ func (m *TaskViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
 		return m, nil
 
 	case tasksLoadedMsg:
@@ -753,16 +765,41 @@ func (m *TaskViewModel) View() string {
 		sb.WriteString("\n\n")
 	}
 
+	// Calculate column widths based on terminal width
+	termWidth := m.width
+	if termWidth < 40 {
+		termWidth = 80 // default fallback
+	}
+
+	// Calculate max list name length if showing lists
+	listColWidth := 0
+	if m.showLists {
+		maxListLen := 4 // minimum "List" header
+		for _, item := range m.items {
+			if len(item.ListName) > maxListLen {
+				maxListLen = len(item.ListName)
+			}
+		}
+		listColWidth = maxListLen + 2 // add padding
+	}
+
+	// Fixed widths: cursor(2) + checkbox(2) + due(12) + padding(4)
+	fixedWidth := 20
+	contentWidth := termWidth - fixedWidth - listColWidth
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+
 	// Header
 	if m.showLists {
-		header := fmt.Sprintf("   %-12s  %-50s  %s", "List", "Task", "Due")
+		header := fmt.Sprintf("   %-*s  %-*s  %s", listColWidth-2, "List", contentWidth, "Task", "Due")
 		sb.WriteString(headerStyle.Render(header))
 	} else {
-		header := fmt.Sprintf("   %-60s  %s", "Task", "Due")
+		header := fmt.Sprintf("   %-*s  %s", contentWidth, "Task", "Due")
 		sb.WriteString(headerStyle.Render(header))
 	}
 	sb.WriteString("\n")
-	sb.WriteString(headerStyle.Render(strings.Repeat("─", 75)))
+	sb.WriteString(headerStyle.Render(strings.Repeat("─", termWidth-2)))
 	sb.WriteString("\n")
 
 	// Task list
@@ -799,7 +836,7 @@ func (m *TaskViewModel) View() string {
 				}
 			}
 
-			line := m.renderTaskLine(i, item)
+			line := m.renderTaskLine(i, item, contentWidth, listColWidth)
 
 			if i == m.cursor {
 				sb.WriteString(selectedStyle.Render(line))
@@ -851,7 +888,7 @@ func (m *TaskViewModel) getTitle() string {
 	return "Tasks"
 }
 
-func (m *TaskViewModel) renderTaskLine(idx int, item TaskItem) string {
+func (m *TaskViewModel) renderTaskLine(idx int, item TaskItem, contentWidth int, listColWidth int) string {
 	cursor := "  "
 	if idx == m.cursor {
 		cursor = "> "
@@ -874,21 +911,21 @@ func (m *TaskViewModel) renderTaskLine(idx int, item TaskItem) string {
 
 	content := item.Task.DisplayContent()
 	if m.showLists {
-		if len(content) > 46 {
-			content = content[:46] + "…"
+		// Account for checkbox space in content width
+		maxContent := contentWidth - 2
+		if len(content) > maxContent && maxContent > 1 {
+			content = content[:maxContent-1] + "…"
 		}
-		listName := item.ListName
-		if len(listName) > 12 {
-			listName = listName[:11] + "…"
-		}
-		return fmt.Sprintf("%s%-12s %s %-47s  %s", cursor, listName, check, content, due)
+		listNameWidth := listColWidth - 2
+		return fmt.Sprintf("%s%-*s %s %-*s  %s", cursor, listNameWidth, item.ListName, check, maxContent, content, due)
 	}
 
 	// Single list view
-	if len(content) > 58 {
-		content = content[:58] + "…"
+	maxContent := contentWidth - 2
+	if len(content) > maxContent && maxContent > 1 {
+		content = content[:maxContent-1] + "…"
 	}
-	return fmt.Sprintf("%s%s %-58s  %s", cursor, check, content, due)
+	return fmt.Sprintf("%s%s %-*s  %s", cursor, check, maxContent, content, due)
 }
 
 func (m *TaskViewModel) getHelp() string {
