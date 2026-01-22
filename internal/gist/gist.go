@@ -187,21 +187,27 @@ func (c *Client) readTaskFiles(tasksDir string) (map[string]GistFile, error) {
 	return files, nil
 }
 
-// createGist creates a new gist
-func (c *Client) createGist(gist *Gist) (*Gist, error) {
-	body, err := json.Marshal(gist)
-	if err != nil {
-		return nil, err
+// doGistRequest performs a gist API request and returns the response
+func (c *Client) doGistRequest(method, url string, body interface{}, expectedStatus int) (*Gist, error) {
+	var reqBody io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		reqBody = bytes.NewReader(data)
 	}
 
-	req, err := http.NewRequest("POST", githubAPIURL+"/gists", bytes.NewReader(body))
+	req, err := http.NewRequest(method, url, reqBody)
 	if err != nil {
 		return nil, err
 	}
 
 	req.Header.Set("Authorization", "Bearer "+c.config.Token)
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Content-Type", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -209,75 +215,9 @@ func (c *Client) createGist(gist *Gist) (*Gist, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to create gist: %s - %s", resp.Status, string(body))
-	}
-
-	var created Gist
-	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
-		return nil, err
-	}
-
-	return &created, nil
-}
-
-// updateGist updates an existing gist
-func (c *Client) updateGist(gist *Gist) (*Gist, error) {
-	body, err := json.Marshal(gist)
-	if err != nil {
-		return nil, err
-	}
-
-	url := fmt.Sprintf("%s/gists/%s", githubAPIURL, c.config.GistID)
-	req, err := http.NewRequest("PATCH", url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+c.config.Token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to update gist: %s - %s", resp.Status, string(body))
-	}
-
-	var updated Gist
-	if err := json.NewDecoder(resp.Body).Decode(&updated); err != nil {
-		return nil, err
-	}
-
-	return &updated, nil
-}
-
-// getGist retrieves the current gist
-func (c *Client) getGist() (*Gist, error) {
-	url := fmt.Sprintf("%s/gists/%s", githubAPIURL, c.config.GistID)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+c.config.Token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to get gist: %s - %s", resp.Status, string(body))
+	if resp.StatusCode != expectedStatus {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("gist API error: %s - %s", resp.Status, string(respBody))
 	}
 
 	var g Gist
@@ -286,6 +226,23 @@ func (c *Client) getGist() (*Gist, error) {
 	}
 
 	return &g, nil
+}
+
+// createGist creates a new gist
+func (c *Client) createGist(gist *Gist) (*Gist, error) {
+	return c.doGistRequest("POST", githubAPIURL+"/gists", gist, http.StatusCreated)
+}
+
+// updateGist updates an existing gist
+func (c *Client) updateGist(gist *Gist) (*Gist, error) {
+	url := fmt.Sprintf("%s/gists/%s", githubAPIURL, c.config.GistID)
+	return c.doGistRequest("PATCH", url, gist, http.StatusOK)
+}
+
+// getGist retrieves the current gist
+func (c *Client) getGist() (*Gist, error) {
+	url := fmt.Sprintf("%s/gists/%s", githubAPIURL, c.config.GistID)
+	return c.doGistRequest("GET", url, nil, http.StatusOK)
 }
 
 // GetGistURL returns the URL of the configured gist

@@ -108,6 +108,22 @@ func (l *TaskList) GetDueTasks() []*Task {
 	return due
 }
 
+// sortByDueDate sorts tasks by due date (earliest first, nil dates last)
+func sortByDueDate(tasks []*Task) {
+	sort.Slice(tasks, func(i, j int) bool {
+		if tasks[i].DueDate == nil && tasks[j].DueDate == nil {
+			return false
+		}
+		if tasks[i].DueDate == nil {
+			return false
+		}
+		if tasks[j].DueDate == nil {
+			return true
+		}
+		return tasks[i].DueDate.Before(*tasks[j].DueDate)
+	})
+}
+
 // SortedTasks returns tasks sorted: pending first (by due date), then completed
 func (l *TaskList) SortedTasks() []*Task {
 	pending := make([]*Task, 0)
@@ -121,33 +137,8 @@ func (l *TaskList) SortedTasks() []*Task {
 		}
 	}
 
-	// Sort pending by due date (earliest first, nil dates last)
-	sort.Slice(pending, func(i, j int) bool {
-		if pending[i].DueDate == nil && pending[j].DueDate == nil {
-			return false
-		}
-		if pending[i].DueDate == nil {
-			return false
-		}
-		if pending[j].DueDate == nil {
-			return true
-		}
-		return pending[i].DueDate.Before(*pending[j].DueDate)
-	})
-
-	// Sort completed by due date as well
-	sort.Slice(completed, func(i, j int) bool {
-		if completed[i].DueDate == nil && completed[j].DueDate == nil {
-			return false
-		}
-		if completed[i].DueDate == nil {
-			return false
-		}
-		if completed[j].DueDate == nil {
-			return true
-		}
-		return completed[i].DueDate.Before(*completed[j].DueDate)
-	})
+	sortByDueDate(pending)
+	sortByDueDate(completed)
 
 	return append(pending, completed...)
 }

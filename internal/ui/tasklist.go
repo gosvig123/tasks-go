@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -99,7 +100,9 @@ type TaskViewModel struct {
 	inputMode    InputMode
 	textInput    textinput.Model
 	descInput    textinput.Model // description input
-	focusedField int             // 0 = title, 1 = description
+	dueInput     textinput.Model // due date input (days offset or YYYY-MM-DD)
+	recurInput   textinput.Model // recurrence days input
+	focusedField int             // 0=title, 1=desc, 2=due, 3=recur
 	searchInput  textinput.Model
 	searchQuery  string
 
@@ -110,6 +113,8 @@ type TaskViewModel struct {
 	// Pending task (for list selection before adding)
 	pendingTaskContent string
 	pendingTaskDesc    string
+	pendingTaskDue     string
+	pendingTaskRecur   string
 
 	// Terminal size
 	width  int
@@ -126,7 +131,7 @@ func NewTaskViewModel(store *storage.Storage, mode ViewMode) *TaskViewModel {
 	ti := textinput.New()
 	ti.Placeholder = "Enter task..."
 	ti.CharLimit = 200
-	ti.Width = 60
+	ti.Width = 50
 
 	si := textinput.New()
 	si.Placeholder = "Search..."
@@ -136,7 +141,17 @@ func NewTaskViewModel(store *storage.Storage, mode ViewMode) *TaskViewModel {
 	di := textinput.New()
 	di.Placeholder = "Description (optional)..."
 	di.CharLimit = 500
-	di.Width = 60
+	di.Width = 50
+
+	dueIn := textinput.New()
+	dueIn.Placeholder = "+7 or 2024-12-31"
+	dueIn.CharLimit = 20
+	dueIn.Width = 20
+
+	recurIn := textinput.New()
+	recurIn.Placeholder = "e.g. 7 for weekly"
+	recurIn.CharLimit = 10
+	recurIn.Width = 20
 
 	return &TaskViewModel{
 		storage:     store,
@@ -144,6 +159,8 @@ func NewTaskViewModel(store *storage.Storage, mode ViewMode) *TaskViewModel {
 		selected:    make(map[int]bool),
 		textInput:   ti,
 		descInput:   di,
+		dueInput:    dueIn,
+		recurInput:  recurIn,
 		searchInput: si,
 		inputMode:   InputNormal,
 		showLists:   mode != ViewSingleList,
@@ -370,10 +387,19 @@ func (m *TaskViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Handle text input updates
-	if m.inputMode == InputAddTask {
+	// Handle text input updates for form modes
+	if m.inputMode == InputAddTask || m.inputMode == InputEditTask {
 		var cmd tea.Cmd
-		m.textInput, cmd = m.textInput.Update(msg)
+		switch m.focusedField {
+		case 0:
+			m.textInput, cmd = m.textInput.Update(msg)
+		case 1:
+			m.descInput, cmd = m.descInput.Update(msg)
+		case 2:
+			m.dueInput, cmd = m.dueInput.Update(msg)
+		case 3:
+			m.recurInput, cmd = m.recurInput.Update(msg)
+		}
 		return m, cmd
 	}
 
@@ -461,12 +487,8 @@ func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		} else if m.viewMode == ViewSingleList || m.viewMode == ViewAllPending {
 			m.inputMode = InputAddTask
-			m.textInput.SetValue("")
-			m.descInput.SetValue("")
-			m.focusedField = 0
-			m.textInput.Focus()
-			m.descInput.Blur()
-			return m, textinput.Blink
+			m.clearFormFields()
+			return m, m.focusFormField(0)
 		}
 
 	case "n":
@@ -563,61 +585,85 @@ func (m *TaskViewModel) startEditTask() tea.Cmd {
 			return nil
 		}
 		item := m.items[m.cursor]
+
+		// Populate form fields with existing task data
 		m.textInput.SetValue(item.Task.Content)
 		m.descInput.SetValue(item.Task.Description)
+
+		// Format due date for display
+		if item.Task.DueDate != nil {
+			m.dueInput.SetValue(item.Task.DueDate.Format("2006-01-02"))
+		} else {
+			m.dueInput.SetValue("")
+		}
+
+		// Set recurrence
+		if item.Task.RecurDays > 0 {
+			m.recurInput.SetValue(fmt.Sprintf("%d", item.Task.RecurDays))
+		} else {
+			m.recurInput.SetValue("")
+		}
+
 		m.focusedField = 0
 		m.textInput.Focus()
 		m.descInput.Blur()
+		m.dueInput.Blur()
+		m.recurInput.Blur()
 		m.inputMode = InputEditTask
 		return textinput.Blink()
 	}
 }
 
 func (m *TaskViewModel) handleEditTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	const numFields = 4
+
 	switch msg.String() {
 	case "esc":
 		m.inputMode = InputNormal
 		m.textInput.Blur()
 		m.descInput.Blur()
+		m.dueInput.Blur()
+		m.recurInput.Blur()
 		m.focusedField = 0
 		return m, nil
 
 	case "tab":
-		// Toggle between title and description fields
-		if m.focusedField == 0 {
-			m.focusedField = 1
-			m.textInput.Blur()
-			m.descInput.Focus()
-			return m, textinput.Blink
-		} else {
-			m.focusedField = 0
-			m.descInput.Blur()
-			m.textInput.Focus()
-			return m, textinput.Blink
-		}
+		nextField := (m.focusedField + 1) % numFields
+		return m, m.focusFormField(nextField)
+
+	case "shift+tab":
+		prevField := (m.focusedField - 1 + numFields) % numFields
+		return m, m.focusFormField(prevField)
 
 	case "enter":
 		content := strings.TrimSpace(m.textInput.Value())
 		if content != "" {
 			m.textInput.Blur()
 			m.descInput.Blur()
+			m.dueInput.Blur()
+			m.recurInput.Blur()
 			m.focusedField = 0
-			return m, m.saveEditedTask(content, m.descInput.Value())
+			return m, m.saveEditedTask(content, m.descInput.Value(), m.dueInput.Value(), m.recurInput.Value())
 		}
 		return m, nil
 	}
 
-	// Handle text input
+	// Handle text input for focused field
 	var cmd tea.Cmd
-	if m.focusedField == 0 {
+	switch m.focusedField {
+	case 0:
 		m.textInput, cmd = m.textInput.Update(msg)
-	} else {
+	case 1:
 		m.descInput, cmd = m.descInput.Update(msg)
+	case 2:
+		m.dueInput, cmd = m.dueInput.Update(msg)
+	case 3:
+		m.recurInput, cmd = m.recurInput.Update(msg)
 	}
 	return m, cmd
 }
 
-func (m *TaskViewModel) saveEditedTask(content, description string) tea.Cmd {
+func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValue string) tea.Cmd {
 	return func() tea.Msg {
 		if m.cursor >= len(m.items) {
 			return nil
@@ -625,9 +671,25 @@ func (m *TaskViewModel) saveEditedTask(content, description string) tea.Cmd {
 
 		item := m.items[m.cursor]
 
+		// Parse due date and recurrence
+		dueOffset, specificDate := parseDueValue(dueValue)
+		recurDays := parseRecurValue(recurValue)
+
 		// Update the task
 		item.Task.Content = content
 		item.Task.Description = description
+		item.Task.RecurDays = recurDays
+
+		// Update due date
+		if specificDate != nil {
+			item.Task.DueDate = specificDate
+		} else if dueOffset > 0 {
+			due := time.Now().AddDate(0, 0, dueOffset)
+			item.Task.DueDate = &due
+		} else if dueValue == "" {
+			// Clear due date if field is empty
+			item.Task.DueDate = nil
+		}
 
 		// Save to the appropriate list
 		listName := m.listName
@@ -644,6 +706,8 @@ func (m *TaskViewModel) saveEditedTask(content, description string) tea.Cmd {
 		if item.Index < len(list.Tasks) {
 			list.Tasks[item.Index].Content = content
 			list.Tasks[item.Index].Description = description
+			list.Tasks[item.Index].DueDate = item.Task.DueDate
+			list.Tasks[item.Index].RecurDays = recurDays
 			m.storage.SaveList(list)
 		}
 
@@ -683,41 +747,78 @@ func (m *TaskViewModel) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// focusFormField focuses the appropriate input based on field index
+func (m *TaskViewModel) focusFormField(field int) tea.Cmd {
+	m.textInput.Blur()
+	m.descInput.Blur()
+	m.dueInput.Blur()
+	m.recurInput.Blur()
+
+	m.focusedField = field
+	switch field {
+	case 0:
+		m.textInput.Focus()
+	case 1:
+		m.descInput.Focus()
+	case 2:
+		m.dueInput.Focus()
+	case 3:
+		m.recurInput.Focus()
+	}
+	return textinput.Blink
+}
+
+// clearFormFields resets all form inputs
+func (m *TaskViewModel) clearFormFields() {
+	m.textInput.SetValue("")
+	m.descInput.SetValue("")
+	m.dueInput.SetValue("")
+	m.recurInput.SetValue("")
+	m.focusedField = 0
+}
+
 func (m *TaskViewModel) handleAddTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	const numFields = 4
+
 	switch msg.String() {
 	case "esc":
 		m.inputMode = InputNormal
 		m.textInput.Blur()
 		m.descInput.Blur()
+		m.dueInput.Blur()
+		m.recurInput.Blur()
 		m.focusedField = 0
 		return m, nil
 
 	case "tab":
-		// Toggle between title and description fields
-		if m.focusedField == 0 {
-			m.focusedField = 1
-			m.textInput.Blur()
-			m.descInput.Focus()
-			return m, textinput.Blink
-		} else {
-			m.focusedField = 0
-			m.descInput.Blur()
-			m.textInput.Focus()
-			return m, textinput.Blink
-		}
+		// Move to next field (wrap around)
+		nextField := (m.focusedField + 1) % numFields
+		return m, m.focusFormField(nextField)
+
+	case "shift+tab":
+		// Move to previous field (wrap around)
+		prevField := (m.focusedField - 1 + numFields) % numFields
+		return m, m.focusFormField(prevField)
 
 	case "enter":
 		content := strings.TrimSpace(m.textInput.Value())
 		if content != "" {
 			description := m.descInput.Value()
+			dueValue := strings.TrimSpace(m.dueInput.Value())
+			recurValue := strings.TrimSpace(m.recurInput.Value())
+
 			m.textInput.Blur()
 			m.descInput.Blur()
+			m.dueInput.Blur()
+			m.recurInput.Blur()
 			m.focusedField = 0
 
 			if m.viewMode == ViewAllPending {
 				// In all-tasks view, show list picker before adding
 				m.pendingTaskContent = content
 				m.pendingTaskDesc = description
+				m.pendingTaskDue = dueValue
+				m.pendingTaskRecur = recurValue
 				m.inputMode = InputSelectListForTask
 				// Pre-select the list of currently selected task
 				if m.cursor < len(m.items) {
@@ -733,17 +834,22 @@ func (m *TaskViewModel) handleAddTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 
 			m.inputMode = InputNormal
-			return m, m.addTask(content, description)
+			return m, m.addTaskWithOptions(content, description, dueValue, recurValue)
 		}
 		return m, nil
 	}
 
 	// Update the focused input
 	var cmd tea.Cmd
-	if m.focusedField == 0 {
+	switch m.focusedField {
+	case 0:
 		m.textInput, cmd = m.textInput.Update(msg)
-	} else {
+	case 1:
 		m.descInput, cmd = m.descInput.Update(msg)
+	case 2:
+		m.dueInput, cmd = m.dueInput.Update(msg)
+	case 3:
+		m.recurInput, cmd = m.recurInput.Update(msg)
 	}
 	return m, cmd
 }
@@ -953,37 +1059,71 @@ func (m *TaskViewModel) deleteTask(idx int) tea.Cmd {
 	}
 }
 
-func (m *TaskViewModel) addTask(content string, description string) tea.Cmd {
-	return func() tea.Msg {
-		dueOffset := 0
-		recurDays := 0
+// parseDueValue parses a due date value which can be:
+// - empty (no due date)
+// - "+N" or "N" (days from now)
+// - "YYYY-MM-DD" (specific date)
+// Returns the due date offset in days (0 means no due date)
+func parseDueValue(value string) (dueOffset int, specificDate *time.Time) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
 
-		if idx := strings.LastIndex(content, " +"); idx > 0 {
-			suffix := content[idx+2:]
-			if strings.HasSuffix(suffix, "r") {
-				fmt.Sscanf(suffix[:len(suffix)-1], "%d", &recurDays)
-				dueOffset = recurDays
-				content = strings.TrimSpace(content[:idx])
-			} else {
-				fmt.Sscanf(suffix, "%d", &dueOffset)
-				if dueOffset > 0 {
-					content = strings.TrimSpace(content[:idx])
-				}
-			}
+	// Try parsing as specific date first
+	if t, err := time.Parse("2006-01-02", value); err == nil {
+		return 0, &t
+	}
+
+	// Parse as days offset (+N or just N)
+	value = strings.TrimPrefix(value, "+")
+	var days int
+	if _, err := fmt.Sscanf(value, "%d", &days); err == nil && days > 0 {
+		return days, nil
+	}
+
+	return 0, nil
+}
+
+// parseRecurValue parses a recurrence value (days between occurrences)
+func parseRecurValue(value string) int {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+
+	var days int
+	fmt.Sscanf(value, "%d", &days)
+	return days
+}
+
+func (m *TaskViewModel) addTaskWithOptions(content, description, dueValue, recurValue string) tea.Cmd {
+	return func() tea.Msg {
+		dueOffset, specificDate := parseDueValue(dueValue)
+		recurDays := parseRecurValue(recurValue)
+
+		// If recur is set but no due date, use recur as due offset
+		if recurDays > 0 && dueOffset == 0 && specificDate == nil {
+			dueOffset = recurDays
 		}
 
 		if m.viewMode == ViewSingleList && m.taskList != nil {
-			// Add to current list
-			m.taskList.AddContent(content, strings.TrimSpace(description), dueOffset, recurDays)
+			t := m.taskList.AddContent(content, strings.TrimSpace(description), dueOffset, recurDays)
+			// If specific date was provided, override the calculated due date
+			if specificDate != nil {
+				t.DueDate = specificDate
+			}
 			m.storage.SaveList(m.taskList)
 		} else if m.viewMode == ViewAllPending && m.cursor < len(m.items) {
-			// Add to the list of the currently selected task
 			item := m.items[m.cursor]
 			list, err := m.storage.LoadList(item.ListName)
 			if err != nil {
 				return nil
 			}
-			list.AddContent(content, strings.TrimSpace(description), dueOffset, recurDays)
+			t := list.AddContent(content, strings.TrimSpace(description), dueOffset, recurDays)
+			if specificDate != nil {
+				t.DueDate = specificDate
+			}
 			m.storage.SaveList(list)
 		} else {
 			return nil
@@ -993,23 +1133,20 @@ func (m *TaskViewModel) addTask(content string, description string) tea.Cmd {
 	}
 }
 
+// addTask is kept for backward compatibility (CLI usage)
+func (m *TaskViewModel) addTask(content string, description string) tea.Cmd {
+	return m.addTaskWithOptions(content, description, "", "")
+}
+
 func (m *TaskViewModel) addTaskToList(content string, description string, listName string) tea.Cmd {
 	return func() tea.Msg {
-		dueOffset := 0
-		recurDays := 0
+		// Use pending values for due and recur
+		dueOffset, specificDate := parseDueValue(m.pendingTaskDue)
+		recurDays := parseRecurValue(m.pendingTaskRecur)
 
-		if idx := strings.LastIndex(content, " +"); idx > 0 {
-			suffix := content[idx+2:]
-			if strings.HasSuffix(suffix, "r") {
-				fmt.Sscanf(suffix[:len(suffix)-1], "%d", &recurDays)
-				dueOffset = recurDays
-				content = strings.TrimSpace(content[:idx])
-			} else {
-				fmt.Sscanf(suffix, "%d", &dueOffset)
-				if dueOffset > 0 {
-					content = strings.TrimSpace(content[:idx])
-				}
-			}
+		// If recur is set but no due date, use recur as due offset
+		if recurDays > 0 && dueOffset == 0 && specificDate == nil {
+			dueOffset = recurDays
 		}
 
 		list, err := m.storage.LoadList(listName)
@@ -1017,12 +1154,17 @@ func (m *TaskViewModel) addTaskToList(content string, description string, listNa
 			return nil
 		}
 
-		list.AddContent(content, strings.TrimSpace(description), dueOffset, recurDays)
+		t := list.AddContent(content, strings.TrimSpace(description), dueOffset, recurDays)
+		if specificDate != nil {
+			t.DueDate = specificDate
+		}
 		m.storage.SaveList(list)
 
 		// Clear pending task
 		m.pendingTaskContent = ""
 		m.pendingTaskDesc = ""
+		m.pendingTaskDue = ""
+		m.pendingTaskRecur = ""
 
 		return m.loadTasks()()
 	}
@@ -1144,7 +1286,7 @@ func (m *TaskViewModel) View() string {
 		leftPanel := panelBorderStyle.Width(leftWidth).Render(leftContent)
 
 		// Render right panel (add task form)
-		rightContent := m.renderAddTaskPanel(rightWidth)
+		rightContent := m.renderTaskFormPanel("Add New Task", "add task")
 		rightPanel := panelBorderStyle.Width(rightWidth).Render(rightContent)
 
 		// Join panels horizontally
@@ -1178,7 +1320,7 @@ func (m *TaskViewModel) View() string {
 		// Render right panel (edit form or task details)
 		var rightContent string
 		if m.inputMode == InputEditTask {
-			rightContent = m.renderEditTaskPanel(rightWidth)
+			rightContent = m.renderTaskFormPanel("Edit Task", "save")
 		} else {
 			rightContent = m.renderTaskDetailPanel(rightWidth)
 		}
@@ -1195,11 +1337,6 @@ func (m *TaskViewModel) View() string {
 		currentList := m.storage.GetCurrentList()
 
 		for i, listName := range m.lists {
-			cursor := "  "
-			if i == m.listCursor {
-				cursor = "> "
-			}
-
 			info, _ := m.storage.GetListInfo(listName)
 			var line string
 			if info != nil {
@@ -1213,9 +1350,9 @@ func (m *TaskViewModel) View() string {
 			}
 
 			if i == m.listCursor {
-				sb.WriteString(cursor + selectedStyle.Render(line))
+				sb.WriteString(selectedStyle.Render("> " + line))
 			} else {
-				sb.WriteString(cursor + normalStyle.Render(line))
+				sb.WriteString(normalStyle.Render("  " + line))
 			}
 			sb.WriteString("\n")
 		}
@@ -1228,11 +1365,6 @@ func (m *TaskViewModel) View() string {
 		sb.WriteString(normalStyle.Render(fmt.Sprintf("Task: %s\n\n", m.pendingTaskContent)))
 
 		for i, listName := range m.lists {
-			cursor := "  "
-			if i == m.listCursor {
-				cursor = "> "
-			}
-
 			info, _ := m.storage.GetListInfo(listName)
 			var line string
 			if info != nil {
@@ -1242,9 +1374,9 @@ func (m *TaskViewModel) View() string {
 			}
 
 			if i == m.listCursor {
-				sb.WriteString(cursor + selectedStyle.Render(line))
+				sb.WriteString(selectedStyle.Render("> " + line))
 			} else {
-				sb.WriteString(cursor + normalStyle.Render(line))
+				sb.WriteString(normalStyle.Render("  " + line))
 			}
 			sb.WriteString("\n")
 		}
@@ -1465,68 +1597,47 @@ func (m *TaskViewModel) renderTaskListPanel(panelWidth int) string {
 	return sb.String()
 }
 
-// renderAddTaskPanel renders the add task form panel
-func (m *TaskViewModel) renderAddTaskPanel(panelWidth int) string {
-	var sb strings.Builder
-
-	sb.WriteString(addPanelTitleStyle.Render("Add New Task"))
-	sb.WriteString("\n\n")
-
-	// Title field
-	titleLabel := "  Task:  "
-	if m.focusedField == 0 {
-		titleLabel = "> Task:  "
-	}
-	sb.WriteString(titleLabel)
-	sb.WriteString(m.textInput.View())
-	sb.WriteString("\n\n")
-
-	// Description field
-	descLabel := "  Desc:  "
-	if m.focusedField == 1 {
-		descLabel = "> Desc:  "
-	}
-	sb.WriteString(descLabel)
-	sb.WriteString(m.descInput.View())
-	sb.WriteString("\n\n")
-
-	sb.WriteString(helpStyle.Render("Tab: switch field"))
-	sb.WriteString("\n")
-	sb.WriteString(helpStyle.Render("Enter: add task"))
-	sb.WriteString("\n")
-	sb.WriteString(helpStyle.Render("Esc: cancel"))
-
-	return sb.String()
+// FormField represents a form field configuration
+type FormField struct {
+	Label string
+	Input *textinput.Model
 }
 
-// renderEditTaskPanel renders the edit task form panel
-func (m *TaskViewModel) renderEditTaskPanel(panelWidth int) string {
+// renderFormField renders a single form field with cursor indicator
+func renderFormField(label string, input textinput.Model, focused bool) string {
+	cursor := "  "
+	if focused {
+		cursor = "> "
+	}
+	return fmt.Sprintf("%s%-6s %s", cursor, label+":", input.View())
+}
+
+// renderTaskFormPanel renders a task form panel for add/edit modes
+func (m *TaskViewModel) renderTaskFormPanel(title, submitText string) string {
 	var sb strings.Builder
 
-	sb.WriteString(addPanelTitleStyle.Render("Edit Task"))
+	sb.WriteString(addPanelTitleStyle.Render(title))
 	sb.WriteString("\n\n")
 
-	// Title field
-	titleLabel := "  Task:  "
-	if m.focusedField == 0 {
-		titleLabel = "> Task:  "
-	}
-	sb.WriteString(titleLabel)
-	sb.WriteString(m.textInput.View())
+	// Task field
+	sb.WriteString(renderFormField("Task", m.textInput, m.focusedField == 0))
 	sb.WriteString("\n\n")
 
 	// Description field
-	descLabel := "  Desc:  "
-	if m.focusedField == 1 {
-		descLabel = "> Desc:  "
-	}
-	sb.WriteString(descLabel)
-	sb.WriteString(m.descInput.View())
+	sb.WriteString(renderFormField("Desc", m.descInput, m.focusedField == 1))
 	sb.WriteString("\n\n")
 
-	sb.WriteString(helpStyle.Render("Tab: switch field"))
+	// Due date field
+	sb.WriteString(renderFormField("Due", m.dueInput, m.focusedField == 2))
+	sb.WriteString("\n\n")
+
+	// Recurrence field
+	sb.WriteString(renderFormField("Recur", m.recurInput, m.focusedField == 3))
+	sb.WriteString("\n\n")
+
+	sb.WriteString(helpStyle.Render("Tab: next field • Shift+Tab: prev"))
 	sb.WriteString("\n")
-	sb.WriteString(helpStyle.Render("Enter: save"))
+	sb.WriteString(helpStyle.Render("Enter: " + submitText))
 	sb.WriteString("\n")
 	sb.WriteString(helpStyle.Render("Esc: cancel"))
 
@@ -2064,18 +2175,13 @@ func (m *ListSwitcherModel) View() string {
 		sb.WriteString("\n")
 	} else {
 		for i, listName := range m.lists {
-			cursor := "  "
-			if i == m.cursor {
-				cursor = "> "
-			}
-
 			info, _ := m.storage.GetListInfo(listName)
 			var line string
 			if info != nil {
 				pending := info.Total - info.Completed
-				line = fmt.Sprintf("%s%-15s  %d pending", cursor, listName, pending)
+				line = fmt.Sprintf("%-15s  %d pending", listName, pending)
 			} else {
-				line = fmt.Sprintf("%s%-15s", cursor, listName)
+				line = fmt.Sprintf("%-15s", listName)
 			}
 
 			if listName == currentList {
@@ -2083,9 +2189,9 @@ func (m *ListSwitcherModel) View() string {
 			}
 
 			if i == m.cursor {
-				sb.WriteString(selectedStyle.Render(line))
+				sb.WriteString(selectedStyle.Render("> " + line))
 			} else {
-				sb.WriteString(normalStyle.Render(line))
+				sb.WriteString(normalStyle.Render("  " + line))
 			}
 			sb.WriteString("\n")
 		}
