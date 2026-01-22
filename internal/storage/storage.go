@@ -16,13 +16,15 @@ type Storage struct {
 	TasksDir        string
 	CurrentListFile string
 	LastResetFile   string
+	LastSyncFile    string
 }
 
-func New(tasksDir, currentListFile, lastResetFile string) *Storage {
+func New(tasksDir, currentListFile, lastResetFile, lastSyncFile string) *Storage {
 	return &Storage{
 		TasksDir:        tasksDir,
 		CurrentListFile: currentListFile,
 		LastResetFile:   lastResetFile,
+		LastSyncFile:    lastSyncFile,
 	}
 }
 
@@ -32,6 +34,7 @@ func DefaultStorage() *Storage {
 		TasksDir:        filepath.Join(home, "tasks-lists"),
 		CurrentListFile: filepath.Join(home, ".current-tasks-list"),
 		LastResetFile:   filepath.Join(home, ".tasks-today-last-reset"),
+		LastSyncFile:    filepath.Join(home, ".tasks-last-sync"),
 	}
 }
 
@@ -189,6 +192,25 @@ func (s *Storage) MarkTodayReset() error {
 	return os.WriteFile(s.LastResetFile, []byte(today), 0644)
 }
 
+// ShouldSyncToday checks if lists should sync to gist today
+func (s *Storage) ShouldSyncToday() bool {
+	data, err := os.ReadFile(s.LastSyncFile)
+	if err != nil {
+		return true // If file doesn't exist, sync is needed
+	}
+
+	lastSync := strings.TrimSpace(string(data))
+	today := time.Now().Format("2006-01-02")
+
+	return lastSync != today
+}
+
+// MarkSyncDone marks that sync has been done today
+func (s *Storage) MarkSyncDone() error {
+	today := time.Now().Format("2006-01-02")
+	return os.WriteFile(s.LastSyncFile, []byte(today), 0644)
+}
+
 // ResetTodayList clears today's list and populates with due tasks
 func (s *Storage) ResetTodayList() (int, error) {
 	if !s.ShouldResetToday() {
@@ -218,11 +240,12 @@ func (s *Storage) ResetTodayList() (int, error) {
 		for _, t := range list.GetDueTasks() {
 			// Create a copy with source reference
 			todayTask := &task.Task{
-				Content:   t.Content,
-				Completed: false,
-				DueDate:   t.DueDate,
-				RecurDays: t.RecurDays,
-				Source:    listName,
+				Content:     t.Content,
+				Description: t.Description,
+				Completed:   false,
+				DueDate:     t.DueDate,
+				RecurDays:   t.RecurDays,
+				Source:      listName,
 			}
 			todayList.Add(todayTask)
 			addedCount++

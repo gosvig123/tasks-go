@@ -20,6 +20,9 @@ func main() {
 	store = storage.DefaultStorage()
 	store.EnsureDir()
 
+	// Perform daily maintenance (today list refresh, gist sync)
+	dailyRefresh()
+
 	if len(os.Args) < 2 {
 		showHelp()
 		return
@@ -106,14 +109,6 @@ func main() {
 }
 
 func runInteractive() {
-	// Reset today's list if needed
-	currentList := store.GetCurrentList()
-	if currentList == "today" {
-		if added, _ := store.ResetTodayList(); added > 0 {
-			fmt.Printf("📅 Auto-added %d due task(s) to today's list\n", added)
-		}
-	}
-
 	if err := ui.RunTaskList(store); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -129,12 +124,6 @@ func runAllInteractive() {
 
 func listPlain() {
 	currentList := store.GetCurrentList()
-
-	// Reset today's list if needed
-	if currentList == "today" {
-		store.ResetTodayList()
-	}
-
 	list, err := store.LoadList(currentList)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading list: %v\n", err)
@@ -177,9 +166,6 @@ func listAll() {
 		fmt.Fprintf(os.Stderr, "Error getting lists: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Reset today's list if it exists
-	store.ResetTodayList()
 
 	currentList := store.GetCurrentList()
 	totalTasks := 0
@@ -264,7 +250,7 @@ func addTask(content string) {
 		}
 	}
 
-	list.AddContent(content, dueOffset, recurDays)
+	list.AddContent(content, "", dueOffset, recurDays)
 
 	if err := store.SaveList(list); err != nil {
 		fmt.Fprintf(os.Stderr, "Error saving list: %v\n", err)
@@ -275,13 +261,8 @@ func addTask(content string) {
 }
 
 func addToday() {
-	// First, auto-add due tasks
-	added, _ := store.ResetTodayList()
-	if added > 0 {
-		fmt.Printf("📅 Auto-added %d due task(s) to today's list\n", added)
-	}
-
-	// Then show interactive picker for manual selection
+	// Show interactive picker for manual selection
+	// (today's list is already refreshed by dailyRefresh on startup)
 	pickerAdded, err := ui.RunAddToday(store)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -361,21 +342,11 @@ func toggleTask(indexStr string) {
 			status = "✅ Completed"
 
 			// Handle recurring tasks
-			if toggled.RecurDays > 0 {
-				nextTask := toggled.CreateNextRecurrence()
-				if nextTask != nil {
-					if toggled.Source != "" {
-						// Add to source list
-						sourceList, err := store.LoadList(toggled.Source)
-						if err == nil {
-							sourceList.Add(nextTask)
-							store.SaveList(sourceList)
-							fmt.Printf("   ↳ Next occurrence added to '%s'\n", toggled.Source)
-						}
-					} else {
-						list.Add(nextTask)
-						fmt.Println("   ↳ Next occurrence created")
-					}
+			if addedTo := handleRecurrence(toggled, list); addedTo != "" {
+				if addedTo == "current" {
+					fmt.Println("   ↳ Next occurrence created")
+				} else {
+					fmt.Printf("   ↳ Next occurrence added to '%s'\n", addedTo)
 				}
 			}
 
@@ -393,6 +364,44 @@ func toggleTask(indexStr string) {
 		fmt.Fprintf(os.Stderr, "Error saving list: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// handleRecurrence creates the next occurrence for a recurring task.
+// For tasks from today list (with Source), it checks if source is already completed
+// to avoid duplicate recurrences. Returns the target list name if recurrence was added.
+func handleRecurrence(toggled *task.Task, currentList *task.TaskList) string {
+	if toggled == nil || !toggled.Completed || toggled.RecurDays <= 0 {
+		return ""
+	}
+
+	nextTask := toggled.CreateNextRecurrence()
+	if nextTask == nil {
+		return ""
+	}
+
+	if toggled.Source != "" {
+		// Task is from today list - add recurrence to source list
+		// but only if source task isn't already completed (to avoid duplicates)
+		sourceList, err := store.LoadList(toggled.Source)
+		if err != nil {
+			return ""
+		}
+
+		for _, t := range sourceList.Tasks {
+			if t.Content == toggled.Content && t.Completed {
+				// Source already completed, recurrence was already created
+				return ""
+			}
+		}
+
+		sourceList.Add(nextTask)
+		store.SaveList(sourceList)
+		return toggled.Source
+	}
+
+	// Task is in its home list - add recurrence to current list
+	currentList.Add(nextTask)
+	return "current"
 }
 
 func syncToSource(todayTask *task.Task) {
@@ -649,6 +658,27 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// dailyRefresh performs all daily maintenance tasks:
+// - Resets the today list (clears and repopulates with due tasks)
+// - Syncs all lists to gist if configured
+func dailyRefresh() {
+	// Always reset today's list on a new day
+	if added, _ := store.ResetTodayList(); added > 0 {
+		fmt.Printf("Auto-refreshed today's list with %d due task(s)\n", added)
+	}
+
+	// Sync to gist if configured and not synced today
+	if store.ShouldSyncToday() {
+		client := gist.NewClient()
+		if client.IsConfigured() {
+			if _, err := client.Sync(store.TasksDir); err == nil {
+				store.MarkSyncDone()
+				fmt.Println("Auto-synced lists to gist")
+			}
+		}
+	}
 }
 
 func parseIndices(s string) []int {

@@ -38,6 +38,16 @@ var (
 	separatorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#5c6370")).
 			Faint(true)
+
+	// Panel styles for split-screen view
+	panelBorderStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("#5c6370")).
+				Padding(0, 1)
+
+	addPanelTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("#98c379"))
 )
 
 // ViewMode determines what tasks to show and how
@@ -55,7 +65,10 @@ type InputMode int
 const (
 	InputNormal InputMode = iota
 	InputAddTask
+	InputEditTask // Edit task in split panel
+	InputViewTask // View task details in split panel
 	InputSwitchList
+	InputSelectListForTask // Select which list to add task to
 	InputSearch
 )
 
@@ -81,24 +94,31 @@ type TaskViewModel struct {
 	taskList *task.TaskList // for single list mode
 
 	// UI state
-	cursor      int
-	selected    map[int]bool // for picker mode
-	inputMode   InputMode
-	textInput   textinput.Model
-	searchInput textinput.Model
-	searchQuery string
+	cursor       int
+	selected     map[int]bool // for picker mode
+	inputMode    InputMode
+	textInput    textinput.Model
+	descInput    textinput.Model // description input
+	focusedField int             // 0 = title, 1 = description
+	searchInput  textinput.Model
+	searchQuery  string
 
 	// List switcher
 	lists      []string
 	listCursor int
+
+	// Pending task (for list selection before adding)
+	pendingTaskContent string
+	pendingTaskDesc    string
 
 	// Terminal size
 	width  int
 	height int
 
 	// State
-	quitting bool
-	added    int // for picker mode: count of added items
+	quitting  bool
+	added     int    // for picker mode: count of added items
+	statusMsg string // temporary status message
 }
 
 // NewTaskViewModel creates a new task view model
@@ -113,11 +133,17 @@ func NewTaskViewModel(store *storage.Storage, mode ViewMode) *TaskViewModel {
 	si.CharLimit = 100
 	si.Width = 40
 
+	di := textinput.New()
+	di.Placeholder = "Description (optional)..."
+	di.CharLimit = 500
+	di.Width = 60
+
 	return &TaskViewModel{
 		storage:     store,
 		viewMode:    mode,
 		selected:    make(map[int]bool),
 		textInput:   ti,
+		descInput:   di,
 		searchInput: si,
 		inputMode:   InputNormal,
 		showLists:   mode != ViewSingleList,
@@ -139,6 +165,10 @@ type listsLoadedMsg struct {
 	lists []string
 }
 
+type AddedToTodayMsg struct {
+	TaskName string
+}
+
 func (m *TaskViewModel) loadTasks() tea.Cmd {
 	return func() tea.Msg {
 		switch m.viewMode {
@@ -151,6 +181,28 @@ func (m *TaskViewModel) loadTasks() tea.Cmd {
 		}
 		return nil
 	}
+}
+
+// sortByDueDate sorts TaskItems so tasks with dates appear first (earliest first),
+// then tasks without dates.
+func sortByDueDate(items []TaskItem) {
+	sort.Slice(items, func(i, j int) bool {
+		di, dj := items[i].Task.DueDate, items[j].Task.DueDate
+		// Both have dates: sort by date
+		if di != nil && dj != nil {
+			return di.Before(*dj)
+		}
+		// Only i has date: i comes first
+		if di != nil && dj == nil {
+			return true
+		}
+		// Only j has date: j comes first
+		if di == nil && dj != nil {
+			return false
+		}
+		// Neither has date: keep original order
+		return false
+	})
 }
 
 func (m *TaskViewModel) loadSingleList() tea.Msg {
@@ -185,6 +237,10 @@ func (m *TaskViewModel) loadSingleList() tea.Msg {
 			uncompleted = append(uncompleted, item)
 		}
 	}
+
+	// Sort by due date (tasks with dates first, earliest first)
+	sortByDueDate(uncompleted)
+	sortByDueDate(completed)
 
 	// Uncompleted first, then completed
 	items := append(uncompleted, completed...)
@@ -225,13 +281,9 @@ func (m *TaskViewModel) loadAllPending() tea.Msg {
 		}
 	}
 
-	// Sort each group by list name
-	sort.Slice(uncompleted, func(i, j int) bool {
-		return uncompleted[i].ListName < uncompleted[j].ListName
-	})
-	sort.Slice(completed, func(i, j int) bool {
-		return completed[i].ListName < completed[j].ListName
-	})
+	// Sort by due date (tasks with dates first, earliest first)
+	sortByDueDate(uncompleted)
+	sortByDueDate(completed)
 
 	// Uncompleted first, then completed
 	items := append(uncompleted, completed...)
@@ -267,9 +319,8 @@ func (m *TaskViewModel) loadPicker() tea.Msg {
 		}
 	}
 
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].ListName < items[j].ListName
-	})
+	// Sort by due date (tasks with dates first, earliest first)
+	sortByDueDate(items)
 
 	return tasksLoadedMsg{items: items}
 }
@@ -313,6 +364,10 @@ func (m *TaskViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	case AddedToTodayMsg:
+		m.statusMsg = fmt.Sprintf("Added to today: %s", msg.TaskName)
+		return m, nil
 	}
 
 	// Handle text input updates
@@ -337,8 +392,14 @@ func (m *TaskViewModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.inputMode {
 	case InputAddTask:
 		return m.handleAddTaskKey(msg)
+	case InputEditTask:
+		return m.handleEditTaskKey(msg)
+	case InputViewTask:
+		return m.handleViewTaskKey(msg)
 	case InputSwitchList:
 		return m.handleSwitchListKey(msg)
+	case InputSelectListForTask:
+		return m.handleSelectListForTaskKey(msg)
 	case InputSearch:
 		return m.handleSearchKey(msg)
 	default:
@@ -347,6 +408,9 @@ func (m *TaskViewModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Clear any status message on key press
+	m.statusMsg = ""
+
 	switch msg.String() {
 	case "q", "esc":
 		m.quitting = true
@@ -367,7 +431,8 @@ func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.addSelectedToToday()
 		}
 		if len(m.items) > 0 {
-			return m, m.toggleTask(m.cursor)
+			m.inputMode = InputViewTask
+			return m, nil
 		}
 
 	case "tab":
@@ -394,10 +459,13 @@ func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			for i := range m.items {
 				m.selected[i] = true
 			}
-		} else if m.viewMode == ViewSingleList {
+		} else if m.viewMode == ViewSingleList || m.viewMode == ViewAllPending {
 			m.inputMode = InputAddTask
 			m.textInput.SetValue("")
+			m.descInput.SetValue("")
+			m.focusedField = 0
 			m.textInput.Focus()
+			m.descInput.Blur()
 			return m, textinput.Blink
 		}
 
@@ -408,11 +476,8 @@ func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "A":
-		if m.viewMode == ViewSingleList {
-			m.inputMode = InputAddTask
-			m.textInput.SetValue("")
-			m.textInput.Focus()
-			return m, textinput.Blink
+		if (m.viewMode == ViewSingleList || m.viewMode == ViewAllPending) && len(m.items) > 0 {
+			return m, m.addCurrentTaskToToday()
 		}
 
 	case "L":
@@ -422,8 +487,13 @@ func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "d":
-		if m.viewMode == ViewSingleList && len(m.items) > 0 {
+		if (m.viewMode == ViewSingleList || m.viewMode == ViewAllPending) && len(m.items) > 0 {
 			return m, m.deleteTask(m.cursor)
+		}
+
+	case "e":
+		if (m.viewMode == ViewSingleList || m.viewMode == ViewAllPending) && len(m.items) > 0 {
+			return m, m.startEditTask()
 		}
 
 	case "/":
@@ -434,6 +504,152 @@ func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m *TaskViewModel) handleViewTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.inputMode = InputNormal
+		return m, nil
+
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+		return m, nil
+
+	case "down", "j":
+		if m.cursor < len(m.items)-1 {
+			m.cursor++
+		}
+		return m, nil
+
+	case "tab", " ":
+		// Toggle task completion
+		if len(m.items) > 0 {
+			return m, m.toggleTask(m.cursor)
+		}
+
+	case "d":
+		// Delete task
+		if len(m.items) > 0 {
+			cmd := m.deleteTask(m.cursor)
+			// If we deleted the last task, go back to normal mode
+			if len(m.items) <= 1 {
+				m.inputMode = InputNormal
+			}
+			return m, cmd
+		}
+
+	case "A":
+		// Add to today
+		if len(m.items) > 0 {
+			return m, m.addCurrentTaskToToday()
+		}
+
+	case "e":
+		// Edit task
+		if len(m.items) > 0 {
+			return m, m.startEditTask()
+		}
+	}
+
+	return m, nil
+}
+
+func (m *TaskViewModel) startEditTask() tea.Cmd {
+	return func() tea.Msg {
+		if m.cursor >= len(m.items) {
+			return nil
+		}
+		item := m.items[m.cursor]
+		m.textInput.SetValue(item.Task.Content)
+		m.descInput.SetValue(item.Task.Description)
+		m.focusedField = 0
+		m.textInput.Focus()
+		m.descInput.Blur()
+		m.inputMode = InputEditTask
+		return textinput.Blink()
+	}
+}
+
+func (m *TaskViewModel) handleEditTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.inputMode = InputNormal
+		m.textInput.Blur()
+		m.descInput.Blur()
+		m.focusedField = 0
+		return m, nil
+
+	case "tab":
+		// Toggle between title and description fields
+		if m.focusedField == 0 {
+			m.focusedField = 1
+			m.textInput.Blur()
+			m.descInput.Focus()
+			return m, textinput.Blink
+		} else {
+			m.focusedField = 0
+			m.descInput.Blur()
+			m.textInput.Focus()
+			return m, textinput.Blink
+		}
+
+	case "enter":
+		content := strings.TrimSpace(m.textInput.Value())
+		if content != "" {
+			m.textInput.Blur()
+			m.descInput.Blur()
+			m.focusedField = 0
+			return m, m.saveEditedTask(content, m.descInput.Value())
+		}
+		return m, nil
+	}
+
+	// Handle text input
+	var cmd tea.Cmd
+	if m.focusedField == 0 {
+		m.textInput, cmd = m.textInput.Update(msg)
+	} else {
+		m.descInput, cmd = m.descInput.Update(msg)
+	}
+	return m, cmd
+}
+
+func (m *TaskViewModel) saveEditedTask(content, description string) tea.Cmd {
+	return func() tea.Msg {
+		if m.cursor >= len(m.items) {
+			return nil
+		}
+
+		item := m.items[m.cursor]
+
+		// Update the task
+		item.Task.Content = content
+		item.Task.Description = description
+
+		// Save to the appropriate list
+		listName := m.listName
+		if m.viewMode == ViewAllPending {
+			listName = item.ListName
+		}
+
+		list, err := m.storage.LoadList(listName)
+		if err != nil {
+			return nil
+		}
+
+		// Find and update the task in the list
+		if item.Index < len(list.Tasks) {
+			list.Tasks[item.Index].Content = content
+			list.Tasks[item.Index].Description = description
+			m.storage.SaveList(list)
+		}
+
+		m.inputMode = InputNormal
+		return tasksLoadedMsg{items: m.items, listName: m.listName, taskList: m.taskList}
+	}
 }
 
 func (m *TaskViewModel) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -472,20 +688,63 @@ func (m *TaskViewModel) handleAddTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.inputMode = InputNormal
 		m.textInput.Blur()
+		m.descInput.Blur()
+		m.focusedField = 0
 		return m, nil
+
+	case "tab":
+		// Toggle between title and description fields
+		if m.focusedField == 0 {
+			m.focusedField = 1
+			m.textInput.Blur()
+			m.descInput.Focus()
+			return m, textinput.Blink
+		} else {
+			m.focusedField = 0
+			m.descInput.Blur()
+			m.textInput.Focus()
+			return m, textinput.Blink
+		}
 
 	case "enter":
 		content := strings.TrimSpace(m.textInput.Value())
 		if content != "" {
-			m.inputMode = InputNormal
+			description := m.descInput.Value()
 			m.textInput.Blur()
-			return m, m.addTask(content)
+			m.descInput.Blur()
+			m.focusedField = 0
+
+			if m.viewMode == ViewAllPending {
+				// In all-tasks view, show list picker before adding
+				m.pendingTaskContent = content
+				m.pendingTaskDesc = description
+				m.inputMode = InputSelectListForTask
+				// Pre-select the list of currently selected task
+				if m.cursor < len(m.items) {
+					defaultList := m.items[m.cursor].ListName
+					for i, list := range m.lists {
+						if list == defaultList {
+							m.listCursor = i
+							break
+						}
+					}
+				}
+				return m, m.loadLists()
+			}
+
+			m.inputMode = InputNormal
+			return m, m.addTask(content, description)
 		}
 		return m, nil
 	}
 
+	// Update the focused input
 	var cmd tea.Cmd
-	m.textInput, cmd = m.textInput.Update(msg)
+	if m.focusedField == 0 {
+		m.textInput, cmd = m.textInput.Update(msg)
+	} else {
+		m.descInput, cmd = m.descInput.Update(msg)
+	}
 	return m, cmd
 }
 
@@ -511,6 +770,35 @@ func (m *TaskViewModel) handleSwitchListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd)
 			m.storage.SetCurrentList(selectedList)
 			m.inputMode = InputNormal
 			return m, m.loadTasks()
+		}
+	}
+
+	return m, nil
+}
+
+func (m *TaskViewModel) handleSelectListForTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.inputMode = InputNormal
+		m.pendingTaskContent = ""
+		m.pendingTaskDesc = ""
+		return m, nil
+
+	case "up", "k":
+		if m.listCursor > 0 {
+			m.listCursor--
+		}
+
+	case "down", "j":
+		if m.listCursor < len(m.lists)-1 {
+			m.listCursor++
+		}
+
+	case "enter":
+		if len(m.lists) > 0 && m.pendingTaskContent != "" {
+			selectedList := m.lists[m.listCursor]
+			m.inputMode = InputNormal
+			return m, m.addTaskToList(m.pendingTaskContent, m.pendingTaskDesc, selectedList)
 		}
 	}
 
@@ -553,20 +841,7 @@ func (m *TaskViewModel) toggleTask(idx int) tea.Cmd {
 			}
 
 			toggled := m.taskList.Toggle(originalIndex)
-			if toggled != nil && toggled.Completed && toggled.RecurDays > 0 {
-				nextTask := toggled.CreateNextRecurrence()
-				if nextTask != nil {
-					if toggled.Source != "" {
-						sourceList, err := m.storage.LoadList(toggled.Source)
-						if err == nil {
-							sourceList.Add(nextTask)
-							m.storage.SaveList(sourceList)
-						}
-					} else {
-						m.taskList.Add(nextTask)
-					}
-				}
-			}
+			m.handleRecurrence(toggled, m.taskList)
 
 			if m.listName == "today" && toggled != nil && toggled.Source != "" {
 				m.syncToSource(toggled)
@@ -574,19 +849,14 @@ func (m *TaskViewModel) toggleTask(idx int) tea.Cmd {
 
 			m.storage.SaveList(m.taskList)
 		} else {
-			// Toggle in source list
+			// Toggle in source list (all-tasks view)
 			list, err := m.storage.LoadList(item.ListName)
 			if err != nil {
 				return nil
 			}
 
 			toggled := list.Toggle(item.Index)
-			if toggled != nil && toggled.Completed && toggled.RecurDays > 0 {
-				nextTask := toggled.CreateNextRecurrence()
-				if nextTask != nil {
-					list.Add(nextTask)
-				}
-			}
+			m.handleRecurrence(toggled, list)
 
 			m.storage.SaveList(list)
 		}
@@ -601,8 +871,10 @@ func (m *TaskViewModel) syncToSource(todayTask *task.Task) {
 		return
 	}
 
+	todayContent := strings.TrimSpace(todayTask.Content)
 	for _, t := range sourceList.Tasks {
-		if t.Content == todayTask.Content {
+		// Match by content (trimmed)
+		if strings.TrimSpace(t.Content) == todayContent {
 			t.Completed = todayTask.Completed
 			break
 		}
@@ -611,31 +883,78 @@ func (m *TaskViewModel) syncToSource(todayTask *task.Task) {
 	m.storage.SaveList(sourceList)
 }
 
+// handleRecurrence creates the next occurrence for a recurring task.
+// For tasks from today list (with Source), it checks if source is already completed
+// to avoid duplicate recurrences. Returns true if recurrence was added.
+func (m *TaskViewModel) handleRecurrence(toggled *task.Task, currentList *task.TaskList) bool {
+	if toggled == nil || !toggled.Completed || toggled.RecurDays <= 0 {
+		return false
+	}
+
+	nextTask := toggled.CreateNextRecurrence()
+	if nextTask == nil {
+		return false
+	}
+
+	if toggled.Source != "" {
+		// Task is from today list - add recurrence to source list
+		// but only if source task isn't already completed (to avoid duplicates)
+		sourceList, err := m.storage.LoadList(toggled.Source)
+		if err != nil {
+			return false
+		}
+
+		for _, t := range sourceList.Tasks {
+			if t.Content == toggled.Content && t.Completed {
+				// Source already completed, recurrence was already created
+				return false
+			}
+		}
+
+		sourceList.Add(nextTask)
+		m.storage.SaveList(sourceList)
+		return true
+	}
+
+	// Task is in its home list - add recurrence to current list
+	currentList.Add(nextTask)
+	return true
+}
+
 func (m *TaskViewModel) deleteTask(idx int) tea.Cmd {
 	return func() tea.Msg {
-		if idx < 0 || idx >= len(m.items) || m.taskList == nil {
+		if idx < 0 || idx >= len(m.items) {
 			return nil
 		}
 
 		item := m.items[idx]
-		originalIndex := m.taskList.OriginalIndex(item.Task)
-		if originalIndex < 0 {
-			return nil
-		}
 
-		m.taskList.Delete(originalIndex)
-		m.storage.SaveList(m.taskList)
+		if m.viewMode == ViewSingleList && m.taskList != nil {
+			// Delete from current list
+			originalIndex := m.taskList.OriginalIndex(item.Task)
+			if originalIndex < 0 {
+				return nil
+			}
+
+			m.taskList.Delete(originalIndex)
+			m.storage.SaveList(m.taskList)
+		} else {
+			// Delete from source list (all-tasks view)
+			list, err := m.storage.LoadList(item.ListName)
+			if err != nil {
+				return nil
+			}
+
+			list.Delete(item.Index)
+			m.storage.SaveList(list)
+		}
 
 		return m.loadTasks()()
 	}
 }
 
-func (m *TaskViewModel) addTask(content string) tea.Cmd {
+func (m *TaskViewModel) addTask(content string, description string) tea.Cmd {
 	return func() tea.Msg {
-		if m.taskList == nil {
-			return nil
-		}
-
 		dueOffset := 0
 		recurDays := 0
 
@@ -653,20 +972,87 @@ func (m *TaskViewModel) addTask(content string) tea.Cmd {
 			}
 		}
 
-		m.taskList.AddContent(content, dueOffset, recurDays)
-		m.storage.SaveList(m.taskList)
+		if m.viewMode == ViewSingleList && m.taskList != nil {
+			// Add to current list
+			m.taskList.AddContent(content, strings.TrimSpace(description), dueOffset, recurDays)
+			m.storage.SaveList(m.taskList)
+		} else if m.viewMode == ViewAllPending && m.cursor < len(m.items) {
+			// Add to the list of the currently selected task
+			item := m.items[m.cursor]
+			list, err := m.storage.LoadList(item.ListName)
+			if err != nil {
+				return nil
+			}
+			list.AddContent(content, strings.TrimSpace(description), dueOffset, recurDays)
+			m.storage.SaveList(list)
+		} else {
+			return nil
+		}
 
 		return m.loadTasks()()
 	}
 }
 
+func (m *TaskViewModel) addTaskToList(content string, description string, listName string) tea.Cmd {
+	return func() tea.Msg {
+		dueOffset := 0
+		recurDays := 0
+
+		if idx := strings.LastIndex(content, " +"); idx > 0 {
+			suffix := content[idx+2:]
+			if strings.HasSuffix(suffix, "r") {
+				fmt.Sscanf(suffix[:len(suffix)-1], "%d", &recurDays)
+				dueOffset = recurDays
+				content = strings.TrimSpace(content[:idx])
+			} else {
+				fmt.Sscanf(suffix, "%d", &dueOffset)
+				if dueOffset > 0 {
+					content = strings.TrimSpace(content[:idx])
+				}
+			}
+		}
+
+		list, err := m.storage.LoadList(listName)
+		if err != nil {
+			return nil
+		}
+
+		list.AddContent(content, strings.TrimSpace(description), dueOffset, recurDays)
+		m.storage.SaveList(list)
+
+		// Clear pending task
+		m.pendingTaskContent = ""
+		m.pendingTaskDesc = ""
+
+		return m.loadTasks()()
+	}
+}
+
+// getOrCreateTodayList loads the today list, creating it if needed
+func (m *TaskViewModel) getOrCreateTodayList() *task.TaskList {
+	todayList, err := m.storage.LoadList("today")
+	if err != nil {
+		m.storage.CreateList("today")
+		todayList, _ = m.storage.LoadList("today")
+	}
+	return todayList
+}
+
+// copyTaskForToday creates a copy of a task for adding to today's list
+func copyTaskForToday(t *task.Task, source string) *task.Task {
+	return &task.Task{
+		Content:     t.Content,
+		Description: t.Description,
+		Completed:   false,
+		DueDate:     t.DueDate,
+		RecurDays:   t.RecurDays,
+		Source:      source,
+	}
+}
+
 func (m *TaskViewModel) addSelectedToToday() tea.Cmd {
 	return func() tea.Msg {
-		todayList, err := m.storage.LoadList("today")
-		if err != nil {
-			m.storage.CreateList("today")
-			todayList, _ = m.storage.LoadList("today")
-		}
+		todayList := m.getOrCreateTodayList()
 
 		added := 0
 		for idx, sel := range m.selected {
@@ -674,15 +1060,7 @@ func (m *TaskViewModel) addSelectedToToday() tea.Cmd {
 				continue
 			}
 			item := m.items[idx]
-
-			todayTask := &task.Task{
-				Content:   item.Task.Content,
-				Completed: false,
-				DueDate:   item.Task.DueDate,
-				RecurDays: item.Task.RecurDays,
-				Source:    item.ListName,
-			}
-			todayList.Add(todayTask)
+			todayList.Add(copyTaskForToday(item.Task, item.ListName))
 			added++
 		}
 
@@ -693,6 +1071,33 @@ func (m *TaskViewModel) addSelectedToToday() tea.Cmd {
 		m.added = added
 		m.quitting = true
 		return tea.Quit()
+	}
+}
+
+func (m *TaskViewModel) addCurrentTaskToToday() tea.Cmd {
+	return func() tea.Msg {
+		if m.cursor >= len(m.items) {
+			return nil
+		}
+
+		item := m.items[m.cursor]
+
+		// Determine source list name
+		sourceList := m.listName
+		if m.viewMode == ViewAllPending {
+			sourceList = item.ListName
+		}
+
+		// Don't add if already in today list
+		if sourceList == "today" {
+			return nil
+		}
+
+		todayList := m.getOrCreateTodayList()
+		todayList.Add(copyTaskForToday(item.Task, sourceList))
+		m.storage.SaveList(todayList)
+
+		return AddedToTodayMsg{TaskName: item.Task.Content}
 	}
 }
 
@@ -717,10 +1122,72 @@ func (m *TaskViewModel) View() string {
 	// Input modes
 	switch m.inputMode {
 	case InputAddTask:
-		sb.WriteString("Add task: ")
-		sb.WriteString(m.textInput.View())
-		sb.WriteString("\n\n")
-		sb.WriteString(helpStyle.Render("Enter: add • Esc: cancel"))
+		// Split-screen view: tasks on left, add form on right
+		termWidth := m.width
+		if termWidth < 60 {
+			termWidth = 80
+		}
+
+		// Calculate panel widths (60% tasks, 40% add form)
+		leftWidth := (termWidth * 55) / 100
+		rightWidth := termWidth - leftWidth - 3 // account for gap
+
+		if leftWidth < 30 {
+			leftWidth = 30
+		}
+		if rightWidth < 25 {
+			rightWidth = 25
+		}
+
+		// Render left panel (task list)
+		leftContent := m.renderTaskListPanel(leftWidth)
+		leftPanel := panelBorderStyle.Width(leftWidth).Render(leftContent)
+
+		// Render right panel (add task form)
+		rightContent := m.renderAddTaskPanel(rightWidth)
+		rightPanel := panelBorderStyle.Width(rightWidth).Render(rightContent)
+
+		// Join panels horizontally
+		splitView := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel)
+		sb.WriteString(splitView)
+
+		return sb.String()
+
+	case InputEditTask, InputViewTask:
+		// Split-screen view: tasks on left, edit form or details on right
+		termWidth := m.width
+		if termWidth < 60 {
+			termWidth = 80
+		}
+
+		// Calculate panel widths (55% tasks, 45% details/edit)
+		leftWidth := (termWidth * 55) / 100
+		rightWidth := termWidth - leftWidth - 3
+
+		if leftWidth < 30 {
+			leftWidth = 30
+		}
+		if rightWidth < 25 {
+			rightWidth = 25
+		}
+
+		// Render left panel (task list)
+		leftContent := m.renderTaskListPanel(leftWidth)
+		leftPanel := panelBorderStyle.Width(leftWidth).Render(leftContent)
+
+		// Render right panel (edit form or task details)
+		var rightContent string
+		if m.inputMode == InputEditTask {
+			rightContent = m.renderEditTaskPanel(rightWidth)
+		} else {
+			rightContent = m.renderTaskDetailPanel(rightWidth)
+		}
+		rightPanel := panelBorderStyle.Width(rightWidth).Render(rightContent)
+
+		// Join panels horizontally
+		splitView := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel)
+		sb.WriteString(splitView)
+
 		return sb.String()
 
 	case InputSwitchList:
@@ -736,9 +1203,9 @@ func (m *TaskViewModel) View() string {
 			info, _ := m.storage.GetListInfo(listName)
 			var line string
 			if info != nil {
-				line = fmt.Sprintf("%s%s (%d/%d)", cursor, listName, info.Completed, info.Total)
+				line = fmt.Sprintf("%s (%d/%d)", listName, info.Completed, info.Total)
 			} else {
-				line = fmt.Sprintf("%s%s", cursor, listName)
+				line = listName
 			}
 
 			if listName == currentList {
@@ -746,14 +1213,43 @@ func (m *TaskViewModel) View() string {
 			}
 
 			if i == m.listCursor {
-				sb.WriteString(selectedStyle.Render(line))
+				sb.WriteString(cursor + selectedStyle.Render(line))
 			} else {
-				sb.WriteString(normalStyle.Render(line))
+				sb.WriteString(cursor + normalStyle.Render(line))
 			}
 			sb.WriteString("\n")
 		}
 		sb.WriteString("\n")
 		sb.WriteString(helpStyle.Render("↑/↓: navigate • Enter: select • Esc: cancel"))
+		return sb.String()
+
+	case InputSelectListForTask:
+		sb.WriteString(headerStyle.Render("Add task to list:\n"))
+		sb.WriteString(normalStyle.Render(fmt.Sprintf("Task: %s\n\n", m.pendingTaskContent)))
+
+		for i, listName := range m.lists {
+			cursor := "  "
+			if i == m.listCursor {
+				cursor = "> "
+			}
+
+			info, _ := m.storage.GetListInfo(listName)
+			var line string
+			if info != nil {
+				line = fmt.Sprintf("%s (%d/%d)", listName, info.Completed, info.Total)
+			} else {
+				line = listName
+			}
+
+			if i == m.listCursor {
+				sb.WriteString(cursor + selectedStyle.Render(line))
+			} else {
+				sb.WriteString(cursor + normalStyle.Render(line))
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+		sb.WriteString(helpStyle.Render("↑/↓: navigate • Enter: add to list • Esc: cancel"))
 		return sb.String()
 	}
 
@@ -846,6 +1342,19 @@ func (m *TaskViewModel) View() string {
 				sb.WriteString(normalStyle.Render(line))
 			}
 			sb.WriteString("\n")
+
+			// Show description if present
+			if item.Task.Description != "" {
+				descLine := m.renderDescriptionLine(item, contentWidth, listColWidth)
+				if i == m.cursor {
+					sb.WriteString(selectedStyle.Render(descLine))
+				} else if item.Task.Completed && m.viewMode != ViewPicker {
+					sb.WriteString(completedStyle.Render(descLine))
+				} else {
+					sb.WriteString(helpStyle.Render(descLine))
+				}
+				sb.WriteString("\n")
+			}
 		}
 
 		// Show count of hidden completed tasks
@@ -856,11 +1365,279 @@ func (m *TaskViewModel) View() string {
 		}
 	}
 
+	// Status message
+	if m.statusMsg != "" {
+		sb.WriteString("\n")
+		sb.WriteString(selectedStyle.Render(m.statusMsg))
+	}
+
 	// Help
 	sb.WriteString("\n")
 	sb.WriteString(helpStyle.Render(m.getHelp()))
 
 	return sb.String()
+}
+
+// renderTaskListPanel renders the task list for a given width (used in split view)
+func (m *TaskViewModel) renderTaskListPanel(panelWidth int) string {
+	var sb strings.Builder
+
+	// Calculate column widths for the panel
+	listColWidth := 0
+	if m.showLists {
+		maxListLen := 4
+		for _, item := range m.items {
+			if len(item.ListName) > maxListLen {
+				maxListLen = len(item.ListName)
+			}
+		}
+		listColWidth = maxListLen + 2
+	}
+
+	fixedWidth := 20
+	contentWidth := panelWidth - fixedWidth - listColWidth
+	if contentWidth < 15 {
+		contentWidth = 15
+	}
+
+	// Header
+	if m.showLists {
+		header := fmt.Sprintf("   %-*s  %-*s  %s", listColWidth-2, "List", contentWidth, "Task", "Due")
+		sb.WriteString(headerStyle.Render(header))
+	} else {
+		header := fmt.Sprintf("   %-*s  %s", contentWidth, "Task", "Due")
+		sb.WriteString(headerStyle.Render(header))
+	}
+	sb.WriteString("\n")
+	sb.WriteString(headerStyle.Render(strings.Repeat("─", panelWidth-4)))
+	sb.WriteString("\n")
+
+	// Task list
+	if len(m.items) == 0 {
+		sb.WriteString(normalStyle.Render("  No tasks."))
+		sb.WriteString("\n")
+	} else {
+		showedCompletedSeparator := false
+		completedShown := 0
+		maxCompletedToShow := 3
+
+		totalCompleted := 0
+		for _, item := range m.items {
+			if item.Task.Completed {
+				totalCompleted++
+			}
+		}
+
+		for i, item := range m.items {
+			if item.Task.Completed && !showedCompletedSeparator && m.viewMode != ViewPicker {
+				showedCompletedSeparator = true
+				sb.WriteString("\n")
+				sb.WriteString(separatorStyle.Render("  ── done ──"))
+				sb.WriteString("\n\n")
+			}
+
+			if item.Task.Completed && m.viewMode != ViewPicker {
+				completedShown++
+				if completedShown > maxCompletedToShow && i != m.cursor {
+					continue
+				}
+			}
+
+			line := m.renderTaskLine(i, item, contentWidth, listColWidth)
+
+			if i == m.cursor {
+				sb.WriteString(selectedStyle.Render(line))
+			} else if item.Task.Completed && m.viewMode != ViewPicker {
+				sb.WriteString(completedStyle.Render(line))
+			} else {
+				sb.WriteString(normalStyle.Render(line))
+			}
+			sb.WriteString("\n")
+		}
+
+		if totalCompleted > maxCompletedToShow && m.viewMode != ViewPicker {
+			hidden := totalCompleted - maxCompletedToShow
+			sb.WriteString(separatorStyle.Render(fmt.Sprintf("  +%d more", hidden)))
+			sb.WriteString("\n")
+		}
+	}
+
+	return sb.String()
+}
+
+// renderAddTaskPanel renders the add task form panel
+func (m *TaskViewModel) renderAddTaskPanel(panelWidth int) string {
+	var sb strings.Builder
+
+	sb.WriteString(addPanelTitleStyle.Render("Add New Task"))
+	sb.WriteString("\n\n")
+
+	// Title field
+	titleLabel := "  Task:  "
+	if m.focusedField == 0 {
+		titleLabel = "> Task:  "
+	}
+	sb.WriteString(titleLabel)
+	sb.WriteString(m.textInput.View())
+	sb.WriteString("\n\n")
+
+	// Description field
+	descLabel := "  Desc:  "
+	if m.focusedField == 1 {
+		descLabel = "> Desc:  "
+	}
+	sb.WriteString(descLabel)
+	sb.WriteString(m.descInput.View())
+	sb.WriteString("\n\n")
+
+	sb.WriteString(helpStyle.Render("Tab: switch field"))
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render("Enter: add task"))
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render("Esc: cancel"))
+
+	return sb.String()
+}
+
+// renderEditTaskPanel renders the edit task form panel
+func (m *TaskViewModel) renderEditTaskPanel(panelWidth int) string {
+	var sb strings.Builder
+
+	sb.WriteString(addPanelTitleStyle.Render("Edit Task"))
+	sb.WriteString("\n\n")
+
+	// Title field
+	titleLabel := "  Task:  "
+	if m.focusedField == 0 {
+		titleLabel = "> Task:  "
+	}
+	sb.WriteString(titleLabel)
+	sb.WriteString(m.textInput.View())
+	sb.WriteString("\n\n")
+
+	// Description field
+	descLabel := "  Desc:  "
+	if m.focusedField == 1 {
+		descLabel = "> Desc:  "
+	}
+	sb.WriteString(descLabel)
+	sb.WriteString(m.descInput.View())
+	sb.WriteString("\n\n")
+
+	sb.WriteString(helpStyle.Render("Tab: switch field"))
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render("Enter: save"))
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render("Esc: cancel"))
+
+	return sb.String()
+}
+
+// renderTaskDetailPanel renders the task detail view panel
+func (m *TaskViewModel) renderTaskDetailPanel(panelWidth int) string {
+	var sb strings.Builder
+
+	if m.cursor >= len(m.items) {
+		return "No task selected"
+	}
+
+	item := m.items[m.cursor]
+	t := item.Task
+
+	// Title
+	sb.WriteString(addPanelTitleStyle.Render("Task Details"))
+	sb.WriteString("\n\n")
+
+	// Status
+	status := "Pending"
+	if t.Completed {
+		status = "Completed"
+	}
+	sb.WriteString(headerStyle.Render("Status: "))
+	sb.WriteString(normalStyle.Render(status))
+	sb.WriteString("\n\n")
+
+	// Content
+	sb.WriteString(headerStyle.Render("Task:"))
+	sb.WriteString("\n")
+	// Word wrap content to fit panel
+	content := t.DisplayContent()
+	maxWidth := panelWidth - 4
+	if maxWidth < 20 {
+		maxWidth = 20
+	}
+	wrapped := wrapText(content, maxWidth)
+	sb.WriteString(selectedStyle.Render(wrapped))
+	sb.WriteString("\n\n")
+
+	// Description
+	if t.Description != "" {
+		sb.WriteString(headerStyle.Render("Description:"))
+		sb.WriteString("\n")
+		wrapped := wrapText(t.Description, maxWidth)
+		sb.WriteString(normalStyle.Render(wrapped))
+		sb.WriteString("\n\n")
+	}
+
+	// Due date
+	if t.DueDate != nil {
+		sb.WriteString(headerStyle.Render("Due: "))
+		sb.WriteString(normalStyle.Render(t.DueDate.Format("2006-01-02")))
+		sb.WriteString("\n\n")
+	}
+
+	// Source (if from another list)
+	if t.Source != "" {
+		sb.WriteString(headerStyle.Render("Source: "))
+		sb.WriteString(normalStyle.Render(t.Source))
+		sb.WriteString("\n\n")
+	}
+
+	// Recurrence
+	if t.RecurDays > 0 {
+		sb.WriteString(headerStyle.Render("Recurs: "))
+		sb.WriteString(normalStyle.Render(fmt.Sprintf("every %d days", t.RecurDays)))
+		sb.WriteString("\n\n")
+	}
+
+	// Help
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render("Tab/Space: toggle"))
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render("e: edit"))
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render("d: delete"))
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render("Esc: close"))
+
+	return sb.String()
+}
+
+// wrapText wraps text to fit within maxWidth
+func wrapText(text string, maxWidth int) string {
+	if len(text) <= maxWidth {
+		return text
+	}
+
+	var result strings.Builder
+	words := strings.Fields(text)
+	lineLen := 0
+
+	for i, word := range words {
+		if i > 0 {
+			if lineLen+1+len(word) > maxWidth {
+				result.WriteString("\n")
+				lineLen = 0
+			} else {
+				result.WriteString(" ")
+				lineLen++
+			}
+		}
+		result.WriteString(word)
+		lineLen += len(word)
+	}
+
+	return result.String()
 }
 
 func (m *TaskViewModel) getTitle() string {
@@ -928,18 +1705,39 @@ func (m *TaskViewModel) renderTaskLine(idx int, item TaskItem, contentWidth int,
 	return fmt.Sprintf("%s%s %-*s  %s", cursor, check, maxContent, content, due)
 }
 
+func (m *TaskViewModel) renderDescriptionLine(item TaskItem, contentWidth int, listColWidth int) string {
+	desc := item.Task.Description
+
+	// Calculate indent: cursor(2) + checkbox(2) = 4, or with list column
+	indent := "     └ "
+	if m.showLists {
+		indent = strings.Repeat(" ", listColWidth) + "  └ "
+	}
+
+	// Truncate description if too long
+	maxDesc := contentWidth - len(indent) - 4
+	if maxDesc < 10 {
+		maxDesc = 10
+	}
+	if len(desc) > maxDesc {
+		desc = desc[:maxDesc-1] + "…"
+	}
+
+	return indent + desc
+}
+
 func (m *TaskViewModel) getHelp() string {
 	switch m.viewMode {
 	case ViewSingleList:
 		if m.inputMode == InputSearch {
 			return "Type to search • ↑/↓: navigate • Enter: keep filter • Esc: clear"
 		}
-		return "↑/↓: navigate • Tab/Enter: toggle • a: add • d: delete • /: search • L: switch list • q: quit"
+		return "↑/↓: navigate • Enter: view • Tab: toggle • a: add • A: +today • e: edit • d: delete • L: lists • q: quit"
 	case ViewAllPending:
 		if m.inputMode == InputSearch {
 			return "Type to search • ↑/↓: navigate • Enter: keep filter • Esc: clear"
 		}
-		return "↑/↓: navigate • Tab/Enter: toggle • /: search • q: quit"
+		return "↑/↓: navigate • Enter: view • Tab: toggle • a: add • A: +today • e: edit • d: delete • q: quit"
 	case ViewPicker:
 		if m.inputMode == InputSearch {
 			return "Type to search • ↑/↓: navigate • Enter: keep filter • Esc: clear"

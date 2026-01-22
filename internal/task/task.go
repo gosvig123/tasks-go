@@ -8,18 +8,20 @@ import (
 )
 
 type Task struct {
-	Content   string
-	Completed bool
-	DueDate   *time.Time
-	RecurDays int
-	CreatedAt *time.Time
-	Source    string // For today's list: which list this task came from
+	Content     string
+	Description string // Optional description for the task
+	Completed   bool
+	DueDate     *time.Time
+	RecurDays   int
+	CreatedAt   *time.Time
+	Source      string // For today's list: which list this task came from
 }
 
 var (
 	dueRegex     = regexp.MustCompile(`@due:(\d{4}-\d{2}-\d{2})`)
 	recurRegex   = regexp.MustCompile(`@recur:(\d+)`)
 	sourceRegex  = regexp.MustCompile(`@source:([a-zA-Z0-9_-]+)`)
+	descRegex    = regexp.MustCompile(`@desc:"([^"]*)"`)
 	createdRegex = regexp.MustCompile(`\|\| (\d{4}-\d{2}-\d{2})$`)
 )
 
@@ -78,6 +80,12 @@ func Parse(line string) (*Task, error) {
 		line = sourceRegex.ReplaceAllString(line, "")
 	}
 
+	// Extract description
+	if match := descRegex.FindStringSubmatch(line); len(match) > 1 {
+		task.Description = match[1]
+		line = descRegex.ReplaceAllString(line, "")
+	}
+
 	task.Content = strings.TrimSpace(line)
 	return task, nil
 }
@@ -106,6 +114,12 @@ func (t *Task) String() string {
 	if t.Source != "" {
 		sb.WriteString(" @source:")
 		sb.WriteString(t.Source)
+	}
+
+	if t.Description != "" {
+		sb.WriteString(" @desc:\"")
+		sb.WriteString(t.Description)
+		sb.WriteString("\"")
 	}
 
 	if t.CreatedAt != nil {
@@ -141,11 +155,12 @@ func (t *Task) CreateNextRecurrence() *Task {
 	now := time.Now()
 
 	return &Task{
-		Content:   t.Content,
-		Completed: false,
-		DueDate:   &nextDue,
-		RecurDays: t.RecurDays,
-		CreatedAt: &now,
-		Source:    "", // New occurrence goes to original list, not today
+		Content:     t.Content,
+		Description: t.Description,
+		Completed:   false,
+		DueDate:     &nextDue,
+		RecurDays:   t.RecurDays,
+		CreatedAt:   &now,
+		Source:      "", // New occurrence goes to original list, not today
 	}
 }
