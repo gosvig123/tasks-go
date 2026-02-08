@@ -109,9 +109,28 @@ func main() {
 }
 
 func runInteractive() {
-	if err := ui.RunTaskList(store); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	for {
+		result, err := ui.RunTaskList(store)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if result == ui.ResultSwitchList {
+			// User wants to switch list - run list switcher then continue
+			selected, err := ui.RunListSwitcher(store)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			if selected == "" {
+				// User cancelled list selection, exit
+				return
+			}
+			// Continue to run task list for selected list
+			continue
+		}
+		// Normal quit
+		return
 	}
 }
 
@@ -272,10 +291,7 @@ func addToday() {
 	// If tasks were added, switch to today list and open task view
 	if pickerAdded > 0 {
 		store.SetCurrentList("today")
-		if err := ui.RunTaskList(store); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+		runInteractive()
 	}
 }
 
@@ -430,10 +446,7 @@ func handleListCommand(args []string) {
 		}
 		// If a list was selected, open the task view
 		if selected != "" {
-			if err := ui.RunTaskList(store); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
+			runInteractive()
 		}
 		return
 	}

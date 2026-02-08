@@ -66,9 +66,8 @@ type InputMode int
 const (
 	InputNormal InputMode = iota
 	InputAddTask
-	InputEditTask // Edit task in split panel
-	InputViewTask // View task details in split panel
-	InputSwitchList
+	InputEditTask          // Edit task in split panel
+	InputViewTask          // View task details in split panel
 	InputSelectListForTask // Select which list to add task to
 	InputSearch
 )
@@ -121,9 +120,10 @@ type TaskViewModel struct {
 	height int
 
 	// State
-	quitting  bool
-	added     int    // for picker mode: count of added items
-	statusMsg string // temporary status message
+	quitting        bool
+	wantsSwitchList bool   // exit to switch list
+	added           int    // for picker mode: count of added items
+	statusMsg       string // temporary status message
 }
 
 // NewTaskViewModel creates a new task view model
@@ -422,8 +422,6 @@ func (m *TaskViewModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleEditTaskKey(msg)
 	case InputViewTask:
 		return m.handleViewTaskKey(msg)
-	case InputSwitchList:
-		return m.handleSwitchListKey(msg)
 	case InputSelectListForTask:
 		return m.handleSelectListForTaskKey(msg)
 	case InputSearch:
@@ -504,8 +502,8 @@ func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "L":
 		if m.viewMode == ViewSingleList {
-			m.inputMode = InputSwitchList
-			return m, m.loadLists()
+			m.wantsSwitchList = true
+			return m, tea.Quit
 		}
 
 	case "d":
@@ -852,34 +850,6 @@ func (m *TaskViewModel) handleAddTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.recurInput, cmd = m.recurInput.Update(msg)
 	}
 	return m, cmd
-}
-
-func (m *TaskViewModel) handleSwitchListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc", "q":
-		m.inputMode = InputNormal
-		return m, nil
-
-	case "up", "k":
-		if m.listCursor > 0 {
-			m.listCursor--
-		}
-
-	case "down", "j":
-		if m.listCursor < len(m.lists)-1 {
-			m.listCursor++
-		}
-
-	case "enter":
-		if len(m.lists) > 0 {
-			selectedList := m.lists[m.listCursor]
-			m.storage.SetCurrentList(selectedList)
-			m.inputMode = InputNormal
-			return m, m.loadTasks()
-		}
-	}
-
-	return m, nil
 }
 
 func (m *TaskViewModel) handleSelectListForTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1330,34 +1300,6 @@ func (m *TaskViewModel) View() string {
 		splitView := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel)
 		sb.WriteString(splitView)
 
-		return sb.String()
-
-	case InputSwitchList:
-		sb.WriteString(headerStyle.Render("Switch to list:\n\n"))
-		currentList := m.storage.GetCurrentList()
-
-		for i, listName := range m.lists {
-			info, _ := m.storage.GetListInfo(listName)
-			var line string
-			if info != nil {
-				line = fmt.Sprintf("%s (%d/%d)", listName, info.Completed, info.Total)
-			} else {
-				line = listName
-			}
-
-			if listName == currentList {
-				line += " *"
-			}
-
-			if i == m.listCursor {
-				sb.WriteString(selectedStyle.Render("> " + line))
-			} else {
-				sb.WriteString(normalStyle.Render("  " + line))
-			}
-			sb.WriteString("\n")
-		}
-		sb.WriteString("\n")
-		sb.WriteString(helpStyle.Render("↑/↓: navigate • Enter: select • Esc: cancel"))
 		return sb.String()
 
 	case InputSelectListForTask:
@@ -1864,11 +1806,25 @@ func (m *TaskViewModel) Added() int {
 
 // Public functions to run different views
 
-func RunTaskList(store *storage.Storage) error {
+// RunTaskListResult indicates the result of running the task list
+type RunTaskListResult int
+
+const (
+	ResultQuit RunTaskListResult = iota
+	ResultSwitchList
+)
+
+func RunTaskList(store *storage.Storage) (RunTaskListResult, error) {
 	model := NewTaskViewModel(store, ViewSingleList)
 	p := tea.NewProgram(model, tea.WithAltScreen())
-	_, err := p.Run()
-	return err
+	finalModel, err := p.Run()
+	if err != nil {
+		return ResultQuit, err
+	}
+	if m, ok := finalModel.(*TaskViewModel); ok && m.wantsSwitchList {
+		return ResultSwitchList, nil
+	}
+	return ResultQuit, nil
 }
 
 func RunAllTasks(store *storage.Storage) error {
