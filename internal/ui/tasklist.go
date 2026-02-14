@@ -2,6 +2,8 @@ package ui
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -12,6 +14,17 @@ import (
 	"github.com/krisitan/tasks-go/internal/storage"
 	"github.com/krisitan/tasks-go/internal/task"
 )
+
+var debugLog *log.Logger
+
+func init() {
+	f, err := os.OpenFile("/tmp/tasks-debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		debugLog = log.New(os.Stderr, "", 0)
+	} else {
+		debugLog = log.New(f, "", log.Lmicroseconds)
+	}
+}
 
 // Styles - consistent across all views
 var (
@@ -46,6 +59,11 @@ var (
 				BorderForeground(lipgloss.Color("#5c6370")).
 				Padding(0, 1)
 
+	focusedPanelBorderStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("#61afef")).
+				Padding(0, 1)
+
 	addPanelTitleStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(lipgloss.Color("#98c379"))
@@ -70,6 +88,8 @@ const (
 	InputViewTask          // View task details in split panel
 	InputSelectListForTask // Select which list to add task to
 	InputSearch
+	InputTimelineSetTime     // Inline input for setting start time in timeline
+	InputTimelineSetEstimate // Inline input for setting estimate in timeline
 )
 
 // TaskItem wraps a task with its source list info
@@ -101,7 +121,9 @@ type TaskViewModel struct {
 	descInput    textinput.Model // description input
 	dueInput     textinput.Model // due date input (days offset or YYYY-MM-DD)
 	recurInput   textinput.Model // recurrence days input
-	focusedField int             // 0=title, 1=desc, 2=due, 3=recur
+	estInput     textinput.Model // estimate input (e.g. "2h", "30m", "1h30m")
+	startInput   textinput.Model // start time input (e.g. "09:00")
+	focusedField int             // 0=title, 1=desc, 2=due, 3=recur, 4=est, 5=start
 	searchInput  textinput.Model
 	searchQuery  string
 
@@ -114,6 +136,8 @@ type TaskViewModel struct {
 	pendingTaskDesc    string
 	pendingTaskDue     string
 	pendingTaskRecur   string
+	pendingTaskEst     string
+	pendingTaskStart   string
 
 	// Terminal size
 	width  int
@@ -124,6 +148,12 @@ type TaskViewModel struct {
 	wantsSwitchList bool   // exit to switch list
 	added           int    // for picker mode: count of added items
 	statusMsg       string // temporary status message
+
+	// Timeline state
+	showTimeline   bool            // whether timeline panel is visible
+	timelineFocus  bool            // whether the right panel (timeline) has focus
+	timelineCursor int             // cursor index within timeline-ordered tasks
+	timelineLayout *TimelineLayout // computed timeline layout
 }
 
 // NewTaskViewModel creates a new task view model
@@ -153,6 +183,16 @@ func NewTaskViewModel(store *storage.Storage, mode ViewMode) *TaskViewModel {
 	recurIn.CharLimit = 10
 	recurIn.Width = 20
 
+	estIn := textinput.New()
+	estIn.Placeholder = "e.g. 2h, 30m, 1h30m"
+	estIn.CharLimit = 10
+	estIn.Width = 20
+
+	startIn := textinput.New()
+	startIn.Placeholder = "e.g. 09:00, 14:30"
+	startIn.CharLimit = 5
+	startIn.Width = 20
+
 	return &TaskViewModel{
 		storage:     store,
 		viewMode:    mode,
@@ -161,6 +201,8 @@ func NewTaskViewModel(store *storage.Storage, mode ViewMode) *TaskViewModel {
 		descInput:   di,
 		dueInput:    dueIn,
 		recurInput:  recurIn,
+		estInput:    estIn,
+		startInput:  startIn,
 		searchInput: si,
 		inputMode:   InputNormal,
 		showLists:   mode != ViewSingleList,
@@ -173,9 +215,11 @@ func (m *TaskViewModel) Init() tea.Cmd {
 
 // Message types
 type tasksLoadedMsg struct {
-	items    []TaskItem
-	listName string
-	taskList *task.TaskList
+	items        []TaskItem
+	listName     string
+	taskList     *task.TaskList
+	showLists    *bool // nil = don't change, non-nil = set to value
+	showTimeline bool
 }
 
 type listsLoadedMsg struct {
@@ -184,6 +228,12 @@ type listsLoadedMsg struct {
 
 type AddedToTodayMsg struct {
 	TaskName string
+}
+
+// timelineRefreshMsg signals that the timeline layout should be recomputed
+// from the current in-memory items (no disk reload needed).
+type timelineRefreshMsg struct {
+	cursorIdx int // timeline cursor to restore after refresh (-1 = don't change)
 }
 
 func (m *TaskViewModel) loadTasks() tea.Cmd {
@@ -225,9 +275,9 @@ func sortByDueDate(items []TaskItem) {
 func (m *TaskViewModel) loadSingleList() tea.Msg {
 	listName := m.storage.GetCurrentList()
 
-	if listName == "today" {
+	isToday := listName == "today"
+	if isToday {
 		m.storage.ResetTodayList()
-		m.showLists = true // Show source list for today's tasks
 	}
 
 	taskList, err := m.storage.LoadList(listName)
@@ -240,7 +290,7 @@ func (m *TaskViewModel) loadSingleList() tea.Msg {
 	for i, t := range taskList.Tasks {
 		// For today list, use Source as the list name to show origin
 		itemListName := listName
-		if listName == "today" && t.Source != "" {
+		if isToday && t.Source != "" {
 			itemListName = t.Source
 		}
 		item := TaskItem{
@@ -263,9 +313,11 @@ func (m *TaskViewModel) loadSingleList() tea.Msg {
 	items := append(uncompleted, completed...)
 
 	return tasksLoadedMsg{
-		items:    items,
-		listName: listName,
-		taskList: taskList,
+		items:        items,
+		listName:     listName,
+		taskList:     taskList,
+		showLists:    &isToday,
+		showTimeline: isToday,
 	}
 }
 
@@ -367,8 +419,15 @@ func (m *TaskViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.allItems = msg.items
 		m.listName = msg.listName
 		m.taskList = msg.taskList
+		if msg.showLists != nil {
+			m.showLists = *msg.showLists
+		}
+		m.showTimeline = msg.showTimeline
 		m.cursor = 0
 		m.searchQuery = ""
+		if m.showTimeline {
+			m.timelineLayout = computeTimelineLayout(m.items, 8, 18)
+		}
 		return m, nil
 
 	case listsLoadedMsg:
@@ -385,6 +444,29 @@ func (m *TaskViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case AddedToTodayMsg:
 		m.statusMsg = fmt.Sprintf("Added to today: %s", msg.TaskName)
 		return m, nil
+
+	case timelineRefreshMsg:
+		if m.showTimeline {
+			m.timelineLayout = computeTimelineLayout(m.items, 8, 18)
+			if msg.cursorIdx >= 0 {
+				m.timelineCursor = msg.cursorIdx
+			}
+			m.syncListCursorFromTimeline()
+		}
+		return m, nil
+	}
+
+	// Handle text input updates for timeline inline inputs
+	if m.inputMode == InputTimelineSetTime {
+		var cmd tea.Cmd
+		m.startInput, cmd = m.startInput.Update(msg)
+		return m, cmd
+	}
+
+	if m.inputMode == InputTimelineSetEstimate {
+		var cmd tea.Cmd
+		m.estInput, cmd = m.estInput.Update(msg)
+		return m, cmd
 	}
 
 	// Handle text input updates for form modes
@@ -399,6 +481,10 @@ func (m *TaskViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.dueInput, cmd = m.dueInput.Update(msg)
 		case 3:
 			m.recurInput, cmd = m.recurInput.Update(msg)
+		case 4:
+			m.estInput, cmd = m.estInput.Update(msg)
+		case 5:
+			m.startInput, cmd = m.startInput.Update(msg)
 		}
 		return m, cmd
 	}
@@ -426,12 +512,21 @@ func (m *TaskViewModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleSelectListForTaskKey(msg)
 	case InputSearch:
 		return m.handleSearchKey(msg)
+	case InputTimelineSetTime:
+		return m.handleTimelineSetTimeKey(msg)
+	case InputTimelineSetEstimate:
+		return m.handleTimelineSetEstimateKey(msg)
 	default:
 		return m.handleNormalKey(msg)
 	}
 }
 
 func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Route to timeline key handler when timeline has focus
+	if m.timelineFocus && m.showTimeline {
+		return m.handleTimelineKey(msg)
+	}
+
 	// Clear any status message on key press
 	m.statusMsg = ""
 
@@ -514,6 +609,25 @@ func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		if (m.viewMode == ViewSingleList || m.viewMode == ViewAllPending) && len(m.items) > 0 {
 			return m, m.startEditTask()
+		}
+
+	case "c":
+		if m.listName == "today" || m.showTimeline {
+			m.showTimeline = !m.showTimeline
+			if !m.showTimeline {
+				m.timelineFocus = false
+			}
+		}
+
+	case "l", "right":
+		if m.showTimeline && !m.timelineFocus {
+			m.timelineFocus = true
+			m.syncTimelineCursor()
+		}
+
+	case "h", "left":
+		if m.timelineFocus {
+			m.timelineFocus = false
 		}
 
 	case "/":
@@ -602,18 +716,43 @@ func (m *TaskViewModel) startEditTask() tea.Cmd {
 			m.recurInput.SetValue("")
 		}
 
+		// Set estimate
+		if item.Task.Estimate != nil {
+			totalMinutes := int(item.Task.Estimate.Minutes())
+			hours := totalMinutes / 60
+			mins := totalMinutes % 60
+			if hours > 0 && mins > 0 {
+				m.estInput.SetValue(fmt.Sprintf("%dh%dm", hours, mins))
+			} else if hours > 0 {
+				m.estInput.SetValue(fmt.Sprintf("%dh", hours))
+			} else {
+				m.estInput.SetValue(fmt.Sprintf("%dm", mins))
+			}
+		} else {
+			m.estInput.SetValue("")
+		}
+
+		// Set start time
+		if item.Task.StartTime != nil {
+			m.startInput.SetValue(item.Task.StartTime.String())
+		} else {
+			m.startInput.SetValue("")
+		}
+
 		m.focusedField = 0
 		m.textInput.Focus()
 		m.descInput.Blur()
 		m.dueInput.Blur()
 		m.recurInput.Blur()
+		m.estInput.Blur()
+		m.startInput.Blur()
 		m.inputMode = InputEditTask
 		return textinput.Blink()
 	}
 }
 
 func (m *TaskViewModel) handleEditTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	const numFields = 4
+	const numFields = 6
 
 	switch msg.String() {
 	case "esc":
@@ -622,6 +761,8 @@ func (m *TaskViewModel) handleEditTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.descInput.Blur()
 		m.dueInput.Blur()
 		m.recurInput.Blur()
+		m.estInput.Blur()
+		m.startInput.Blur()
 		m.focusedField = 0
 		return m, nil
 
@@ -640,8 +781,10 @@ func (m *TaskViewModel) handleEditTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.descInput.Blur()
 			m.dueInput.Blur()
 			m.recurInput.Blur()
+			m.estInput.Blur()
+			m.startInput.Blur()
 			m.focusedField = 0
-			return m, m.saveEditedTask(content, m.descInput.Value(), m.dueInput.Value(), m.recurInput.Value())
+			return m, m.saveEditedTask(content, m.descInput.Value(), m.dueInput.Value(), m.recurInput.Value(), m.estInput.Value(), m.startInput.Value())
 		}
 		return m, nil
 	}
@@ -657,11 +800,15 @@ func (m *TaskViewModel) handleEditTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.dueInput, cmd = m.dueInput.Update(msg)
 	case 3:
 		m.recurInput, cmd = m.recurInput.Update(msg)
+	case 4:
+		m.estInput, cmd = m.estInput.Update(msg)
+	case 5:
+		m.startInput, cmd = m.startInput.Update(msg)
 	}
 	return m, cmd
 }
 
-func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValue string) tea.Cmd {
+func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValue, estValue, startValue string) tea.Cmd {
 	return func() tea.Msg {
 		if m.cursor >= len(m.items) {
 			return nil
@@ -672,11 +819,15 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 		// Parse due date and recurrence
 		dueOffset, specificDate := parseDueValue(dueValue)
 		recurDays := parseRecurValue(recurValue)
+		estimate := parseEstimateValue(estValue)
+		startTime := parseStartTimeValue(startValue)
 
 		// Update the task
 		item.Task.Content = content
 		item.Task.Description = description
 		item.Task.RecurDays = recurDays
+		item.Task.Estimate = estimate
+		item.Task.StartTime = startTime
 
 		// Update due date
 		if specificDate != nil {
@@ -706,11 +857,18 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 			list.Tasks[item.Index].Description = description
 			list.Tasks[item.Index].DueDate = item.Task.DueDate
 			list.Tasks[item.Index].RecurDays = recurDays
+			list.Tasks[item.Index].Estimate = estimate
+			list.Tasks[item.Index].StartTime = startTime
 			m.storage.SaveList(list)
 		}
 
+		// For today reference tasks, propagate edits to the source list
+		if listName == "today" && item.Task.IsReference() {
+			m.syncMetadataToSource(item.Task)
+		}
+
 		m.inputMode = InputNormal
-		return tasksLoadedMsg{items: m.items, listName: m.listName, taskList: m.taskList}
+		return m.loadTasks()()
 	}
 }
 
@@ -745,12 +903,326 @@ func (m *TaskViewModel) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// Timeline key handling and helpers
+
+func (m *TaskViewModel) handleTimelineKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.statusMsg = ""
+
+	switch msg.String() {
+	case "q", "esc":
+		m.quitting = true
+		return m, tea.Quit
+
+	case "h", "left":
+		m.timelineFocus = false
+		return m, nil
+
+	case "up", "k":
+		if m.timelineCursor > 0 {
+			m.timelineCursor--
+			m.syncListCursorFromTimeline()
+		}
+		return m, nil
+
+	case "down", "j":
+		totalItems := len(m.timelineLayout.Slots) + len(m.timelineLayout.Unscheduled)
+		if m.timelineCursor < totalItems-1 {
+			m.timelineCursor++
+			m.syncListCursorFromTimeline()
+		}
+		return m, nil
+
+	case "K":
+		// Move task up: floating tasks reorder, pinned tasks nudge -30m
+		return m, m.timelineMoveTask(-1)
+
+	case "J":
+		// Move task down: floating tasks reorder, pinned tasks nudge +30m
+		return m, m.timelineMoveTask(1)
+
+	case "s":
+		// Set start time (pin the task)
+		if m.timelineLayout != nil {
+			totalItems := len(m.timelineLayout.Slots) + len(m.timelineLayout.Unscheduled)
+			if m.timelineCursor < totalItems {
+				m.inputMode = InputTimelineSetTime
+				m.startInput.SetValue("")
+				m.startInput.Focus()
+				return m, textinput.Blink
+			}
+		}
+
+	case "S":
+		// Unpin (remove StartTime)
+		return m, m.timelineUnpinTask()
+
+	case "e":
+		// Set/change estimate
+		m.inputMode = InputTimelineSetEstimate
+		m.estInput.SetValue("")
+		m.estInput.Focus()
+		return m, textinput.Blink
+
+	case "tab", " ":
+		// Toggle completion
+		if len(m.items) > 0 {
+			return m, m.toggleTask(m.cursor)
+		}
+
+	case "d":
+		// Delete task
+		if len(m.items) > 0 {
+			return m, m.deleteTask(m.cursor)
+		}
+
+	case "a":
+		// Add task — switch to list panel and open add form
+		m.timelineFocus = false
+		m.inputMode = InputAddTask
+		m.textInput.SetValue("")
+		m.descInput.SetValue("")
+		m.dueInput.SetValue("")
+		m.recurInput.SetValue("")
+		m.estInput.SetValue("")
+		m.startInput.SetValue("")
+		m.focusedField = 0
+		m.textInput.Focus()
+		return m, textinput.Blink
+
+	case "enter":
+		// View task details
+		if m.cursor >= 0 && m.cursor < len(m.items) {
+			m.timelineFocus = false
+			m.inputMode = InputViewTask
+			return m, nil
+		}
+	}
+
+	return m, nil
+}
+
+func (m *TaskViewModel) handleTimelineSetTimeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.inputMode = InputNormal
+		m.startInput.Blur()
+		return m, nil
+	case "enter":
+		value := strings.TrimSpace(m.startInput.Value())
+		m.startInput.Blur()
+		m.inputMode = InputNormal
+		if value != "" {
+			return m, m.timelineSetStartTime(value)
+		}
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.startInput, cmd = m.startInput.Update(msg)
+	return m, cmd
+}
+
+func (m *TaskViewModel) handleTimelineSetEstimateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.inputMode = InputNormal
+		m.estInput.Blur()
+		return m, nil
+	case "enter":
+		value := strings.TrimSpace(m.estInput.Value())
+		m.estInput.Blur()
+		m.inputMode = InputNormal
+		if value != "" {
+			return m, m.timelineSetEstimate(value)
+		}
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.estInput, cmd = m.estInput.Update(msg)
+	return m, cmd
+}
+
+func (m *TaskViewModel) getTimelineTask() *task.Task {
+	if m.timelineLayout == nil {
+		return nil
+	}
+	if m.timelineCursor < len(m.timelineLayout.Slots) {
+		return m.timelineLayout.Slots[m.timelineCursor].Item.Task
+	}
+	unschedIdx := m.timelineCursor - len(m.timelineLayout.Slots)
+	if unschedIdx >= 0 && unschedIdx < len(m.timelineLayout.Unscheduled) {
+		return m.timelineLayout.Unscheduled[unschedIdx].Task
+	}
+	return nil
+}
+
+func (m *TaskViewModel) timelineSetStartTime(value string) tea.Cmd {
+	return func() tea.Msg {
+		t := m.getTimelineTask()
+		if t == nil {
+			return nil
+		}
+		startTime := parseStartTimeValue(value)
+		if startTime == nil {
+			return nil
+		}
+		t.StartTime = startTime
+
+		if m.taskList != nil {
+			m.storage.SaveList(m.taskList)
+		}
+		if m.listName == "today" && t.IsReference() {
+			m.syncMetadataToSource(t)
+		}
+		return timelineRefreshMsg{cursorIdx: m.timelineCursor}
+	}
+}
+
+func (m *TaskViewModel) timelineSetEstimate(value string) tea.Cmd {
+	return func() tea.Msg {
+		t := m.getTimelineTask()
+		if t == nil {
+			return nil
+		}
+		est := parseEstimateValue(value)
+		if est == nil {
+			return nil
+		}
+		t.Estimate = est
+
+		if m.taskList != nil {
+			m.storage.SaveList(m.taskList)
+		}
+		if m.listName == "today" && t.IsReference() {
+			m.syncMetadataToSource(t)
+		}
+		return timelineRefreshMsg{cursorIdx: m.timelineCursor}
+	}
+}
+
+func (m *TaskViewModel) timelineUnpinTask() tea.Cmd {
+	return func() tea.Msg {
+		t := m.getTimelineTask()
+		if t == nil {
+			return nil
+		}
+		t.StartTime = nil
+
+		if m.taskList != nil {
+			m.storage.SaveList(m.taskList)
+		}
+		if m.listName == "today" && t.IsReference() {
+			m.syncMetadataToSource(t)
+		}
+		return timelineRefreshMsg{cursorIdx: m.timelineCursor}
+	}
+}
+
+func (m *TaskViewModel) timelineMoveTask(direction int) tea.Cmd {
+	return func() tea.Msg {
+		if m.timelineLayout == nil || m.timelineCursor >= len(m.timelineLayout.Slots) {
+			return nil
+		}
+
+		slot := m.timelineLayout.Slots[m.timelineCursor]
+		t := slot.Item.Task
+		newCursor := m.timelineCursor
+
+		if slot.IsPinned && t.StartTime != nil {
+			// Pinned task: nudge by 30 minutes
+			newMinutes := t.StartTime.ToMinutes() + direction*30
+			if newMinutes < 0 {
+				newMinutes = 0
+			}
+			if newMinutes > 23*60+30 {
+				newMinutes = 23*60 + 30
+			}
+			t.StartTime = &task.TimeOfDay{
+				Hour:   newMinutes / 60,
+				Minute: newMinutes % 60,
+			}
+		} else {
+			// Floating task: swap with adjacent floating task in the slots
+			targetIdx := m.timelineCursor + direction
+			if targetIdx < 0 || targetIdx >= len(m.timelineLayout.Slots) {
+				return nil
+			}
+			targetSlot := m.timelineLayout.Slots[targetIdx]
+			if targetSlot.IsPinned {
+				return nil // Can't swap with pinned
+			}
+			// Swap the tasks in the actual task list
+			if m.taskList != nil {
+				idx1 := m.taskList.OriginalIndex(slot.Item.Task)
+				idx2 := m.taskList.OriginalIndex(targetSlot.Item.Task)
+				if idx1 >= 0 && idx2 >= 0 && idx1 < len(m.taskList.Tasks) && idx2 < len(m.taskList.Tasks) {
+					m.taskList.Tasks[idx1], m.taskList.Tasks[idx2] = m.taskList.Tasks[idx2], m.taskList.Tasks[idx1]
+				}
+			}
+			newCursor = targetIdx
+		}
+
+		// Save
+		if m.taskList != nil {
+			m.storage.SaveList(m.taskList)
+		}
+		if m.listName == "today" && t.IsReference() {
+			m.syncMetadataToSource(t)
+		}
+		return timelineRefreshMsg{cursorIdx: newCursor}
+	}
+}
+
+func (m *TaskViewModel) syncTimelineCursor() {
+	if m.timelineLayout == nil || m.cursor >= len(m.items) {
+		return
+	}
+	currentTask := m.items[m.cursor].Task
+	for i, slot := range m.timelineLayout.Slots {
+		if slot.Item.Task == currentTask {
+			m.timelineCursor = i
+			return
+		}
+	}
+	// Check unscheduled
+	for i, item := range m.timelineLayout.Unscheduled {
+		if item.Task == currentTask {
+			m.timelineCursor = len(m.timelineLayout.Slots) + i
+			return
+		}
+	}
+}
+
+func (m *TaskViewModel) syncListCursorFromTimeline() {
+	if m.timelineLayout == nil {
+		return
+	}
+	var targetTask *task.Task
+	if m.timelineCursor < len(m.timelineLayout.Slots) {
+		targetTask = m.timelineLayout.Slots[m.timelineCursor].Item.Task
+	} else {
+		unschedIdx := m.timelineCursor - len(m.timelineLayout.Slots)
+		if unschedIdx >= 0 && unschedIdx < len(m.timelineLayout.Unscheduled) {
+			targetTask = m.timelineLayout.Unscheduled[unschedIdx].Task
+		}
+	}
+	if targetTask != nil {
+		for i, item := range m.items {
+			if item.Task == targetTask {
+				m.cursor = i
+				return
+			}
+		}
+	}
+}
+
 // focusFormField focuses the appropriate input based on field index
 func (m *TaskViewModel) focusFormField(field int) tea.Cmd {
 	m.textInput.Blur()
 	m.descInput.Blur()
 	m.dueInput.Blur()
 	m.recurInput.Blur()
+	m.estInput.Blur()
+	m.startInput.Blur()
 
 	m.focusedField = field
 	switch field {
@@ -762,6 +1234,10 @@ func (m *TaskViewModel) focusFormField(field int) tea.Cmd {
 		m.dueInput.Focus()
 	case 3:
 		m.recurInput.Focus()
+	case 4:
+		m.estInput.Focus()
+	case 5:
+		m.startInput.Focus()
 	}
 	return textinput.Blink
 }
@@ -772,11 +1248,13 @@ func (m *TaskViewModel) clearFormFields() {
 	m.descInput.SetValue("")
 	m.dueInput.SetValue("")
 	m.recurInput.SetValue("")
+	m.estInput.SetValue("")
+	m.startInput.SetValue("")
 	m.focusedField = 0
 }
 
 func (m *TaskViewModel) handleAddTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	const numFields = 4
+	const numFields = 6
 
 	switch msg.String() {
 	case "esc":
@@ -785,6 +1263,8 @@ func (m *TaskViewModel) handleAddTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.descInput.Blur()
 		m.dueInput.Blur()
 		m.recurInput.Blur()
+		m.estInput.Blur()
+		m.startInput.Blur()
 		m.focusedField = 0
 		return m, nil
 
@@ -804,11 +1284,15 @@ func (m *TaskViewModel) handleAddTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			description := m.descInput.Value()
 			dueValue := strings.TrimSpace(m.dueInput.Value())
 			recurValue := strings.TrimSpace(m.recurInput.Value())
+			estValue := strings.TrimSpace(m.estInput.Value())
+			startValue := strings.TrimSpace(m.startInput.Value())
 
 			m.textInput.Blur()
 			m.descInput.Blur()
 			m.dueInput.Blur()
 			m.recurInput.Blur()
+			m.estInput.Blur()
+			m.startInput.Blur()
 			m.focusedField = 0
 
 			if m.viewMode == ViewAllPending {
@@ -817,6 +1301,8 @@ func (m *TaskViewModel) handleAddTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.pendingTaskDesc = description
 				m.pendingTaskDue = dueValue
 				m.pendingTaskRecur = recurValue
+				m.pendingTaskEst = estValue
+				m.pendingTaskStart = startValue
 				m.inputMode = InputSelectListForTask
 				// Pre-select the list of currently selected task
 				if m.cursor < len(m.items) {
@@ -832,7 +1318,7 @@ func (m *TaskViewModel) handleAddTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 
 			m.inputMode = InputNormal
-			return m, m.addTaskWithOptions(content, description, dueValue, recurValue)
+			return m, m.addTaskWithOptions(content, description, dueValue, recurValue, estValue, startValue)
 		}
 		return m, nil
 	}
@@ -848,6 +1334,10 @@ func (m *TaskViewModel) handleAddTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.dueInput, cmd = m.dueInput.Update(msg)
 	case 3:
 		m.recurInput, cmd = m.recurInput.Update(msg)
+	case 4:
+		m.estInput, cmd = m.estInput.Update(msg)
+	case 5:
+		m.startInput, cmd = m.startInput.Update(msg)
 	}
 	return m, cmd
 }
@@ -952,6 +1442,33 @@ func (m *TaskViewModel) syncToSource(todayTask *task.Task) {
 		// Match by content (trimmed)
 		if strings.TrimSpace(t.Content) == todayContent {
 			t.Completed = todayTask.Completed
+			break
+		}
+	}
+
+	m.storage.SaveList(sourceList)
+}
+
+// syncMetadataToSource propagates metadata changes from a today reference
+// task back to the source list (the single source of truth).
+func (m *TaskViewModel) syncMetadataToSource(todayTask *task.Task) {
+	if todayTask.Source == "" {
+		return
+	}
+
+	sourceList, err := m.storage.LoadList(todayTask.Source)
+	if err != nil {
+		return
+	}
+
+	todayContent := strings.TrimSpace(todayTask.Content)
+	for _, t := range sourceList.Tasks {
+		if strings.TrimSpace(t.Content) == todayContent {
+			t.Estimate = todayTask.Estimate
+			t.StartTime = todayTask.StartTime
+			t.Description = todayTask.Description
+			t.DueDate = todayTask.DueDate
+			t.RecurDays = todayTask.RecurDays
 			break
 		}
 	}
@@ -1067,10 +1584,52 @@ func parseRecurValue(value string) int {
 	return days
 }
 
-func (m *TaskViewModel) addTaskWithOptions(content, description, dueValue, recurValue string) tea.Cmd {
+func parseEstimateValue(value string) *time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	var totalMinutes int
+	// Parse hours
+	if idx := strings.Index(value, "h"); idx > 0 {
+		var hours int
+		fmt.Sscanf(value[:idx], "%d", &hours)
+		totalMinutes += hours * 60
+		value = value[idx+1:]
+	}
+	// Parse minutes
+	value = strings.TrimSuffix(value, "m")
+	if value != "" {
+		var mins int
+		fmt.Sscanf(value, "%d", &mins)
+		totalMinutes += mins
+	}
+	if totalMinutes > 0 {
+		d := time.Duration(totalMinutes) * time.Minute
+		return &d
+	}
+	return nil
+}
+
+func parseStartTimeValue(value string) *task.TimeOfDay {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	var hour, minute int
+	n, _ := fmt.Sscanf(value, "%d:%d", &hour, &minute)
+	if n == 2 && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 {
+		return &task.TimeOfDay{Hour: hour, Minute: minute}
+	}
+	return nil
+}
+
+func (m *TaskViewModel) addTaskWithOptions(content, description, dueValue, recurValue, estValue, startValue string) tea.Cmd {
 	return func() tea.Msg {
 		dueOffset, specificDate := parseDueValue(dueValue)
 		recurDays := parseRecurValue(recurValue)
+		estimate := parseEstimateValue(estValue)
+		startTime := parseStartTimeValue(startValue)
 
 		// If recur is set but no due date, use recur as due offset
 		if recurDays > 0 && dueOffset == 0 && specificDate == nil {
@@ -1083,6 +1642,8 @@ func (m *TaskViewModel) addTaskWithOptions(content, description, dueValue, recur
 			if specificDate != nil {
 				t.DueDate = specificDate
 			}
+			t.Estimate = estimate
+			t.StartTime = startTime
 			m.storage.SaveList(m.taskList)
 		} else if m.viewMode == ViewAllPending && m.cursor < len(m.items) {
 			item := m.items[m.cursor]
@@ -1094,6 +1655,8 @@ func (m *TaskViewModel) addTaskWithOptions(content, description, dueValue, recur
 			if specificDate != nil {
 				t.DueDate = specificDate
 			}
+			t.Estimate = estimate
+			t.StartTime = startTime
 			m.storage.SaveList(list)
 		} else {
 			return nil
@@ -1105,14 +1668,16 @@ func (m *TaskViewModel) addTaskWithOptions(content, description, dueValue, recur
 
 // addTask is kept for backward compatibility (CLI usage)
 func (m *TaskViewModel) addTask(content string, description string) tea.Cmd {
-	return m.addTaskWithOptions(content, description, "", "")
+	return m.addTaskWithOptions(content, description, "", "", "", "")
 }
 
 func (m *TaskViewModel) addTaskToList(content string, description string, listName string) tea.Cmd {
 	return func() tea.Msg {
-		// Use pending values for due and recur
+		// Use pending values for due, recur, est, start
 		dueOffset, specificDate := parseDueValue(m.pendingTaskDue)
 		recurDays := parseRecurValue(m.pendingTaskRecur)
+		estimate := parseEstimateValue(m.pendingTaskEst)
+		startTime := parseStartTimeValue(m.pendingTaskStart)
 
 		// If recur is set but no due date, use recur as due offset
 		if recurDays > 0 && dueOffset == 0 && specificDate == nil {
@@ -1128,6 +1693,8 @@ func (m *TaskViewModel) addTaskToList(content string, description string, listNa
 		if specificDate != nil {
 			t.DueDate = specificDate
 		}
+		t.Estimate = estimate
+		t.StartTime = startTime
 		m.storage.SaveList(list)
 
 		// Clear pending task
@@ -1135,6 +1702,8 @@ func (m *TaskViewModel) addTaskToList(content string, description string, listNa
 		m.pendingTaskDesc = ""
 		m.pendingTaskDue = ""
 		m.pendingTaskRecur = ""
+		m.pendingTaskEst = ""
+		m.pendingTaskStart = ""
 
 		return m.loadTasks()()
 	}
@@ -1150,15 +1719,12 @@ func (m *TaskViewModel) getOrCreateTodayList() *task.TaskList {
 	return todayList
 }
 
-// copyTaskForToday creates a copy of a task for adding to today's list
+// copyTaskForToday creates a reference stub for adding to today's list.
+// The source list remains the single truth for all metadata.
 func copyTaskForToday(t *task.Task, source string) *task.Task {
 	return &task.Task{
-		Content:     t.Content,
-		Description: t.Description,
-		Completed:   false,
-		DueDate:     t.DueDate,
-		RecurDays:   t.RecurDays,
-		Source:      source,
+		Content: t.Content,
+		Source:  source,
 	}
 }
 
@@ -1223,6 +1789,12 @@ func (m *TaskViewModel) View() string {
 
 	if m.items == nil {
 		return "Loading..."
+	}
+
+	// Timeline split view for today's list in normal/search/timeline-input modes
+	if m.showTimeline && (m.inputMode == InputNormal || m.inputMode == InputSearch ||
+		m.inputMode == InputTimelineSetTime || m.inputMode == InputTimelineSetEstimate) {
+		return m.renderTimelineSplitView()
 	}
 
 	var sb strings.Builder
@@ -1452,6 +2024,144 @@ func (m *TaskViewModel) View() string {
 	return sb.String()
 }
 
+// renderTimelineSplitView renders the split view with task list and timeline
+func (m *TaskViewModel) renderTimelineSplitView() string {
+	var sb strings.Builder
+
+	// Title
+	sb.WriteString(titleStyle.Render(m.getTitle()))
+	sb.WriteString("\n\n")
+
+	// Search bar (if searching)
+	if m.inputMode == InputSearch {
+		sb.WriteString("🔍 Search: ")
+		sb.WriteString(m.searchInput.View())
+		sb.WriteString(fmt.Sprintf("  (%d matches)", len(m.items)))
+		sb.WriteString("\n\n")
+	}
+
+	termWidth := m.width
+	if termWidth < 60 {
+		termWidth = 80
+	}
+	termHeight := m.height
+	if termHeight < 10 {
+		termHeight = 30
+	}
+
+	// Full-width panel (minus small margin)
+	panelWidth := termWidth - 4
+	if panelWidth < 40 {
+		panelWidth = 40
+	}
+
+	debugLog.Printf("renderTimelineSplitView: termW=%d termH=%d panelW=%d items=%d", termWidth, termHeight, panelWidth, len(m.items))
+
+	// Calculate overhead: title(2) + search(2?) + status(1) + help(1) + gaps(2) + borders(4 for 2 panels)
+	overhead := 10
+	if m.inputMode == InputSearch {
+		overhead += 2
+	}
+	if m.statusMsg != "" {
+		overhead += 1
+	}
+
+	// Available height for both panels (subtract overhead for title, help, borders, gaps)
+	usableHeight := termHeight - overhead
+
+	// Render task list content and measure its natural height
+	taskListContent := m.renderTaskListPanel(panelWidth)
+	taskListLines := lipgloss.Height(taskListContent)
+	if taskListLines < 1 {
+		taskListLines = 1
+	}
+
+	// Cap task list to at most 40% of usable space so timeline always gets room
+	maxTaskListHeight := usableHeight * 40 / 100
+	if maxTaskListHeight < 3 {
+		maxTaskListHeight = 3
+	}
+	taskListHeight := taskListLines
+	if taskListHeight > maxTaskListHeight {
+		taskListHeight = maxTaskListHeight
+	}
+
+	debugLog.Printf("  usableH=%d taskListLines=%d taskListH=%d maxTaskListH=%d", usableHeight, taskListLines, taskListHeight, maxTaskListHeight)
+
+	// Timeline gets the remaining space (accounting for borders: 2 per panel + 1 gap)
+	timelineHeight := usableHeight - taskListHeight - 5
+	if timelineHeight < 5 {
+		timelineHeight = 5
+	}
+
+	// Render task list panel
+	topStyle := panelBorderStyle
+	if !m.timelineFocus {
+		topStyle = focusedPanelBorderStyle
+	}
+	topPanel := topStyle.Width(panelWidth).Height(taskListHeight).Render(taskListContent)
+
+	// Render timeline panel
+	var selectedTask *task.Task
+	if m.cursor >= 0 && m.cursor < len(m.items) {
+		selectedTask = m.items[m.cursor].Task
+	}
+
+	if m.timelineLayout == nil {
+		m.timelineLayout = computeTimelineLayout(m.items, 8, 18)
+	}
+
+	debugLog.Printf("  timelineH=%d contentW=%d", timelineHeight, panelWidth-2)
+
+	timelineContentHeight := timelineHeight - 2
+	if timelineContentHeight < 1 {
+		timelineContentHeight = 1
+	}
+	timelineContentWidth := panelWidth - 2
+	if timelineContentWidth < 10 {
+		timelineContentWidth = 10
+	}
+	timelineContent := renderTimeline(m.timelineLayout, timelineContentWidth, timelineContentHeight, selectedTask, time.Now())
+
+	bottomStyle := panelBorderStyle
+	if m.timelineFocus {
+		bottomStyle = focusedPanelBorderStyle
+	}
+	bottomPanel := bottomStyle.Width(panelWidth).Height(timelineHeight).Render(timelineContent)
+
+	// Stack vertically
+	sb.WriteString(topPanel)
+	sb.WriteString("\n")
+	sb.WriteString(bottomPanel)
+
+	// Status message
+	if m.statusMsg != "" {
+		sb.WriteString("\n")
+		sb.WriteString(selectedStyle.Render(m.statusMsg))
+	}
+
+	// Help bar
+	sb.WriteString("\n")
+	switch m.inputMode {
+	case InputTimelineSetTime:
+		sb.WriteString(helpStyle.Render("Set start time: "))
+		sb.WriteString(m.startInput.View())
+		sb.WriteString(helpStyle.Render("  (Enter: confirm • Esc: cancel)"))
+	case InputTimelineSetEstimate:
+		sb.WriteString(helpStyle.Render("Set estimate: "))
+		sb.WriteString(m.estInput.View())
+		sb.WriteString(helpStyle.Render("  (Enter: confirm • Esc: cancel)"))
+	default:
+		if m.timelineFocus {
+			sb.WriteString(helpStyle.Render("j/k: navigate • J/K: reorder • s: set time • S: unpin • e: est. • h/←: list"))
+		} else {
+			sb.WriteString(helpStyle.Render(m.getHelp() + " • l/→: timeline • c: hide timeline"))
+		}
+	}
+
+	return sb.String()
+}
+
 // renderTaskListPanel renders the task list for a given width (used in split view)
 func (m *TaskViewModel) renderTaskListPanel(panelWidth int) string {
 	var sb strings.Builder
@@ -1577,6 +2287,14 @@ func (m *TaskViewModel) renderTaskFormPanel(title, submitText string) string {
 	sb.WriteString(renderFormField("Recur", m.recurInput, m.focusedField == 3))
 	sb.WriteString("\n\n")
 
+	// Estimate field
+	sb.WriteString(renderFormField("Est", m.estInput, m.focusedField == 4))
+	sb.WriteString("\n\n")
+
+	// Start time field
+	sb.WriteString(renderFormField("Start", m.startInput, m.focusedField == 5))
+	sb.WriteString("\n\n")
+
 	sb.WriteString(helpStyle.Render("Tab: next field • Shift+Tab: prev"))
 	sb.WriteString("\n")
 	sb.WriteString(helpStyle.Render("Enter: " + submitText))
@@ -1650,6 +2368,29 @@ func (m *TaskViewModel) renderTaskDetailPanel(panelWidth int) string {
 	if t.RecurDays > 0 {
 		sb.WriteString(headerStyle.Render("Recurs: "))
 		sb.WriteString(normalStyle.Render(fmt.Sprintf("every %d days", t.RecurDays)))
+		sb.WriteString("\n\n")
+	}
+
+	// Estimate
+	if t.Estimate != nil {
+		sb.WriteString(headerStyle.Render("Estimate: "))
+		totalMinutes := int(t.Estimate.Minutes())
+		hours := totalMinutes / 60
+		mins := totalMinutes % 60
+		if hours > 0 && mins > 0 {
+			sb.WriteString(normalStyle.Render(fmt.Sprintf("%dh%dm", hours, mins)))
+		} else if hours > 0 {
+			sb.WriteString(normalStyle.Render(fmt.Sprintf("%dh", hours)))
+		} else {
+			sb.WriteString(normalStyle.Render(fmt.Sprintf("%dm", mins)))
+		}
+		sb.WriteString("\n\n")
+	}
+
+	// Start time
+	if t.StartTime != nil {
+		sb.WriteString(headerStyle.Render("Starts at: "))
+		sb.WriteString(normalStyle.Render(t.StartTime.String()))
 		sb.WriteString("\n\n")
 	}
 

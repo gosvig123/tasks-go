@@ -14,7 +14,22 @@ type Task struct {
 	DueDate     *time.Time
 	RecurDays   int
 	CreatedAt   *time.Time
-	Source      string // For today's list: which list this task came from
+	Source      string         // For today's list: which list this task came from
+	Estimate    *time.Duration // @est:2h, @est:30m, @est:1h30m
+	StartTime   *TimeOfDay     // @at:09:00, @at:14:30
+}
+
+type TimeOfDay struct {
+	Hour   int
+	Minute int
+}
+
+func (t TimeOfDay) String() string {
+	return fmt.Sprintf("%02d:%02d", t.Hour, t.Minute)
+}
+
+func (t TimeOfDay) ToMinutes() int {
+	return t.Hour*60 + t.Minute
 }
 
 var (
@@ -22,6 +37,8 @@ var (
 	recurRegex   = regexp.MustCompile(`@recur:(\d+)`)
 	sourceRegex  = regexp.MustCompile(`@source:([a-zA-Z0-9_-]+)`)
 	descRegex    = regexp.MustCompile(`@desc:"([^"]*)"`)
+	estRegex     = regexp.MustCompile(`@est:(\d+h)?(\d+m)?`)
+	startRegex   = regexp.MustCompile(`@at:(\d{1,2}:\d{2})`)
 	createdRegex = regexp.MustCompile(`\|\| (\d{4}-\d{2}-\d{2})$`)
 )
 
@@ -86,6 +103,36 @@ func Parse(line string) (*Task, error) {
 		line = descRegex.ReplaceAllString(line, "")
 	}
 
+	// Extract estimate
+	if match := estRegex.FindStringSubmatch(line); match != nil {
+		var totalMinutes int
+		if match[1] != "" {
+			var h int
+			fmt.Sscanf(match[1], "%dh", &h)
+			totalMinutes += h * 60
+		}
+		if match[2] != "" {
+			var m int
+			fmt.Sscanf(match[2], "%dm", &m)
+			totalMinutes += m
+		}
+		if totalMinutes > 0 {
+			d := time.Duration(totalMinutes) * time.Minute
+			task.Estimate = &d
+		}
+		line = estRegex.ReplaceAllString(line, "")
+	}
+
+	// Extract start time
+	if match := startRegex.FindStringSubmatch(line); len(match) > 1 {
+		var h, m int
+		fmt.Sscanf(match[1], "%d:%d", &h, &m)
+		if h >= 0 && h <= 23 && m >= 0 && m <= 59 {
+			task.StartTime = &TimeOfDay{Hour: h, Minute: m}
+		}
+		line = startRegex.ReplaceAllString(line, "")
+	}
+
 	task.Content = strings.TrimSpace(line)
 	return task, nil
 }
@@ -116,6 +163,24 @@ func (t *Task) String() string {
 		sb.WriteString(t.Source)
 	}
 
+	if t.Estimate != nil {
+		totalMinutes := int(t.Estimate.Minutes())
+		hours := totalMinutes / 60
+		minutes := totalMinutes % 60
+		sb.WriteString(" @est:")
+		if hours > 0 {
+			sb.WriteString(fmt.Sprintf("%dh", hours))
+		}
+		if minutes > 0 {
+			sb.WriteString(fmt.Sprintf("%dm", minutes))
+		}
+	}
+
+	if t.StartTime != nil {
+		sb.WriteString(" @at:")
+		sb.WriteString(t.StartTime.String())
+	}
+
 	if t.Description != "" {
 		sb.WriteString(" @desc:\"")
 		sb.WriteString(t.Description)
@@ -128,6 +193,42 @@ func (t *Task) String() string {
 	}
 
 	return sb.String()
+}
+
+// StubString serializes only the reference fields for today's list.
+// The source list is the single truth for metadata like @est, @at, @due, etc.
+func (t *Task) StubString() string {
+	var sb strings.Builder
+
+	if t.Completed {
+		sb.WriteString("[x] ")
+	} else {
+		sb.WriteString("[] ")
+	}
+
+	sb.WriteString(t.Content)
+
+	if t.Source != "" {
+		sb.WriteString(" @source:")
+		sb.WriteString(t.Source)
+	}
+
+	return sb.String()
+}
+
+// IsReference returns true if this task is a reference stub (has a source).
+func (t *Task) IsReference() bool {
+	return t.Source != ""
+}
+
+// ResolveFrom copies metadata from a source task into this reference.
+func (t *Task) ResolveFrom(source *Task) {
+	t.DueDate = source.DueDate
+	t.RecurDays = source.RecurDays
+	t.Estimate = source.Estimate
+	t.StartTime = source.StartTime
+	t.Description = source.Description
+	t.CreatedAt = source.CreatedAt
 }
 
 // DisplayContent returns the content without metadata for display
@@ -162,5 +263,6 @@ func (t *Task) CreateNextRecurrence() *Task {
 		RecurDays:   t.RecurDays,
 		CreatedAt:   &now,
 		Source:      "", // New occurrence goes to original list, not today
+		Estimate:    t.Estimate,
 	}
 }

@@ -73,6 +73,11 @@ func main() {
 		}
 		toggleTask(args[0])
 
+	// Calendar timeline view
+	case "cal":
+		store.SetCurrentList("today")
+		runInteractive()
+
 	// List management
 	case "list", "ls":
 		handleListCommand(args)
@@ -907,6 +912,7 @@ func showHelp() {
 	fmt.Println("  tasks a|add 'task +N'     - Add task with due date N days from now")
 	fmt.Println("  tasks a|add 'task +Nr'    - Add recurring task every N days")
 	fmt.Println("  tasks add today           - Populate today's list with due tasks")
+	fmt.Println("  tasks cal                 - Open today's timeline view")
 	fmt.Println("  tasks d|delete <#>        - Delete task by index")
 	fmt.Println("  tasks t|toggle <#>        - Toggle task completion")
 	fmt.Println()

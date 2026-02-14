@@ -62,15 +62,30 @@ func (s *Storage) ListPath(name string) string {
 	return filepath.Join(s.TasksDir, name+".md")
 }
 
-// LoadList loads a task list from disk
+// LoadList loads a task list from disk.
+// For the "today" list, references are resolved against source lists.
 func (s *Storage) LoadList(name string) (*task.TaskList, error) {
+	list, err := s.loadListRaw(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if name == "today" {
+		s.ResolveReferences(list)
+	}
+
+	return list, nil
+}
+
+// loadListRaw loads a task list without resolving references.
+func (s *Storage) loadListRaw(name string) (*task.TaskList, error) {
 	list := task.NewTaskList(name)
 	path := s.ListPath(name)
 
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return list, nil // Return empty list if file doesn't exist
+			return list, nil
 		}
 		return nil, err
 	}
@@ -87,7 +102,40 @@ func (s *Storage) LoadList(name string) (*task.TaskList, error) {
 	return list, scanner.Err()
 }
 
-// SaveList saves a task list to disk
+// ResolveReferences enriches reference tasks in today's list
+// with metadata from their source lists.
+func (s *Storage) ResolveReferences(todayList *task.TaskList) {
+	// Group references by source list to avoid loading the same list multiple times
+	sourceCache := make(map[string]*task.TaskList)
+
+	for _, t := range todayList.Tasks {
+		if !t.IsReference() {
+			continue
+		}
+
+		sourceList, ok := sourceCache[t.Source]
+		if !ok {
+			loaded, err := s.loadListRaw(t.Source)
+			if err != nil {
+				continue
+			}
+			sourceCache[t.Source] = loaded
+			sourceList = loaded
+		}
+
+		// Find matching task by content in source list
+		content := strings.TrimSpace(t.Content)
+		for _, src := range sourceList.Tasks {
+			if strings.TrimSpace(src.Content) == content {
+				t.ResolveFrom(src)
+				break
+			}
+		}
+	}
+}
+
+// SaveList saves a task list to disk.
+// For the "today" list, only reference stubs are persisted (no resolved metadata).
 func (s *Storage) SaveList(list *task.TaskList) error {
 	if err := s.EnsureDir(); err != nil {
 		return err
@@ -101,7 +149,11 @@ func (s *Storage) SaveList(list *task.TaskList) error {
 	defer file.Close()
 
 	for _, t := range list.Tasks {
-		fmt.Fprintln(file, t.String())
+		if list.Name == "today" && t.IsReference() {
+			fmt.Fprintln(file, t.StubString())
+		} else {
+			fmt.Fprintln(file, t.String())
+		}
 	}
 
 	return nil
@@ -238,14 +290,10 @@ func (s *Storage) ResetTodayList() (int, error) {
 		}
 
 		for _, t := range list.GetDueTasks() {
-			// Create a copy with source reference
+			// Create a reference stub — source list is the single truth
 			todayTask := &task.Task{
-				Content:     t.Content,
-				Description: t.Description,
-				Completed:   false,
-				DueDate:     t.DueDate,
-				RecurDays:   t.RecurDays,
-				Source:      listName,
+				Content: t.Content,
+				Source:  listName,
 			}
 			todayList.Add(todayTask)
 			addedCount++
