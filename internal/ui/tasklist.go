@@ -94,9 +94,11 @@ const (
 
 // TaskItem wraps a task with its source list info
 type TaskItem struct {
-	Task     *task.Task
-	ListName string
-	Index    int // original index in list
+	Task      *task.Task
+	ListName  string
+	Index     int  // original index in list (parent index for subtasks)
+	SubIndex  int  // -1 for top-level, 0+ for subtask position
+	IsSubtask bool // controls indented rendering
 }
 
 // TaskViewModel is the unified model for all task views
@@ -293,24 +295,43 @@ func (m *TaskViewModel) loadSingleList() tea.Msg {
 		if isToday && t.Source != "" {
 			itemListName = t.Source
 		}
-		item := TaskItem{
+		parentItem := TaskItem{
 			Task:     t,
 			ListName: itemListName,
 			Index:    i,
+			SubIndex: -1,
 		}
 		if t.Completed {
-			completed = append(completed, item)
+			completed = append(completed, parentItem)
 		} else {
-			uncompleted = append(uncompleted, item)
+			uncompleted = append(uncompleted, parentItem)
+		}
+		// Flatten subtasks immediately after parent
+		for si, sub := range t.Subtasks {
+			subItemListName := itemListName
+			if isToday && sub.Source != "" {
+				subItemListName = sub.Source
+			}
+			subItem := TaskItem{
+				Task:      sub,
+				ListName:  subItemListName,
+				Index:     i,
+				SubIndex:  si,
+				IsSubtask: true,
+			}
+			// Group with parent (same bucket)
+			if t.Completed {
+				completed = append(completed, subItem)
+			} else {
+				uncompleted = append(uncompleted, subItem)
+			}
 		}
 	}
 
-	// Sort by due date (tasks with dates first, earliest first)
-	sortByDueDate(uncompleted)
-	sortByDueDate(completed)
-
-	// Uncompleted first, then completed
-	items := append(uncompleted, completed...)
+	// Uncompleted first, then completed (ensure non-nil so View() distinguishes "loaded empty" from "not loaded")
+	items := make([]TaskItem, 0, len(uncompleted)+len(completed))
+	items = append(items, uncompleted...)
+	items = append(items, completed...)
 
 	return tasksLoadedMsg{
 		items:        items,
@@ -337,25 +358,39 @@ func (m *TaskViewModel) loadAllPending() tea.Msg {
 		}
 
 		for i, t := range list.Tasks {
-			item := TaskItem{
+			parentItem := TaskItem{
 				Task:     t,
 				ListName: listName,
 				Index:    i,
+				SubIndex: -1,
 			}
 			if t.Completed {
-				completed = append(completed, item)
+				completed = append(completed, parentItem)
 			} else {
-				uncompleted = append(uncompleted, item)
+				uncompleted = append(uncompleted, parentItem)
+			}
+			// Flatten subtasks immediately after parent
+			for si, sub := range t.Subtasks {
+				subItem := TaskItem{
+					Task:      sub,
+					ListName:  listName,
+					Index:     i,
+					SubIndex:  si,
+					IsSubtask: true,
+				}
+				if t.Completed {
+					completed = append(completed, subItem)
+				} else {
+					uncompleted = append(uncompleted, subItem)
+				}
 			}
 		}
 	}
 
-	// Sort by due date (tasks with dates first, earliest first)
-	sortByDueDate(uncompleted)
-	sortByDueDate(completed)
-
-	// Uncompleted first, then completed
-	items := append(uncompleted, completed...)
+	// Uncompleted first, then completed (ensure non-nil so View() distinguishes "loaded empty" from "not loaded")
+	items := make([]TaskItem, 0, len(uncompleted)+len(completed))
+	items = append(items, uncompleted...)
+	items = append(items, completed...)
 
 	return tasksLoadedMsg{items: items}
 }
@@ -366,7 +401,7 @@ func (m *TaskViewModel) loadPicker() tea.Msg {
 		return nil
 	}
 
-	var items []TaskItem
+	items := make([]TaskItem, 0)
 	for _, listName := range lists {
 		if listName == "today" {
 			continue
@@ -383,13 +418,23 @@ func (m *TaskViewModel) loadPicker() tea.Msg {
 					Task:     t,
 					ListName: listName,
 					Index:    i,
+					SubIndex: -1,
 				})
+				// Flatten subtasks immediately after parent
+				for si, sub := range t.Subtasks {
+					if !sub.Completed {
+						items = append(items, TaskItem{
+							Task:      sub,
+							ListName:  listName,
+							Index:     i,
+							SubIndex:  si,
+							IsSubtask: true,
+						})
+					}
+				}
 			}
 		}
 	}
-
-	// Sort by due date (tasks with dates first, earliest first)
-	sortByDueDate(items)
 
 	return tasksLoadedMsg{items: items}
 }
@@ -865,6 +910,14 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 		// For today reference tasks, propagate edits to the source list
 		if listName == "today" && item.Task.IsReference() {
 			m.syncMetadataToSource(item.Task)
+
+			// If due date changed to no longer be today, remove from today list
+			if !item.Task.IsDueToday() {
+				if item.Index < len(list.Tasks) {
+					list.Delete(item.Index)
+					m.storage.SaveList(list)
+				}
+			}
 		}
 
 		m.inputMode = InputNormal
@@ -2465,6 +2518,11 @@ func (m *TaskViewModel) renderTaskLine(idx int, item TaskItem, contentWidth int,
 		cursor = "> "
 	}
 
+	indent := ""
+	if item.IsSubtask {
+		indent = "    "
+	}
+
 	// Checkbox
 	check := "☐"
 	if m.viewMode == ViewPicker {
@@ -2481,22 +2539,40 @@ func (m *TaskViewModel) renderTaskLine(idx int, item TaskItem, contentWidth int,
 	}
 
 	content := item.Task.DisplayContent()
+
+	// Add subtask progress indicator for parent tasks
+	if !item.IsSubtask && len(item.Task.Subtasks) > 0 {
+		done := 0
+		for _, sub := range item.Task.Subtasks {
+			if sub.Completed {
+				done++
+			}
+		}
+		content = fmt.Sprintf("%s [%d/%d]", content, done, len(item.Task.Subtasks))
+	}
+
 	if m.showLists {
 		// Account for checkbox space in content width
 		maxContent := contentWidth - 2
+		if item.IsSubtask {
+			maxContent -= 4
+		}
 		if len(content) > maxContent && maxContent > 1 {
 			content = content[:maxContent-1] + "…"
 		}
 		listNameWidth := listColWidth - 2
-		return fmt.Sprintf("%s%-*s %s %-*s  %s", cursor, listNameWidth, item.ListName, check, maxContent, content, due)
+		return fmt.Sprintf("%s%s%-*s %s %-*s  %s", indent, cursor, listNameWidth, item.ListName, check, maxContent, content, due)
 	}
 
 	// Single list view
 	maxContent := contentWidth - 2
+	if item.IsSubtask {
+		maxContent -= 4
+	}
 	if len(content) > maxContent && maxContent > 1 {
 		content = content[:maxContent-1] + "…"
 	}
-	return fmt.Sprintf("%s%s %-*s  %s", cursor, check, maxContent, content, due)
+	return fmt.Sprintf("%s%s%s %-*s  %s", indent, cursor, check, maxContent, content, due)
 }
 
 func (m *TaskViewModel) renderDescriptionLine(item TaskItem, contentWidth int, listColWidth int) string {
