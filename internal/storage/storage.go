@@ -91,15 +91,20 @@ func (s *Storage) loadListRaw(name string) (*task.TaskList, error) {
 	}
 	defer file.Close()
 
+	var lines []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		line := scanner.Text()
-		if t, err := task.Parse(line); err == nil {
-			list.Add(t)
-		}
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 
-	return list, scanner.Err()
+	for _, t := range task.ParseLines(lines) {
+		list.Add(t)
+	}
+
+	return list, nil
 }
 
 // ResolveReferences enriches reference tasks in today's list
@@ -295,6 +300,16 @@ func (s *Storage) ResetTodayList() (int, error) {
 				Content: t.Content,
 				Source:  listName,
 			}
+			// Copy subtasks as reference stubs
+			for _, sub := range t.Subtasks {
+				todaySub := &task.Task{
+					Content:   sub.Content,
+					Completed: sub.Completed,
+					Source:    listName,
+					Parent:    todayTask,
+				}
+				todayTask.Subtasks = append(todayTask.Subtasks, todaySub)
+			}
 			todayList.Add(todayTask)
 			addedCount++
 		}
@@ -345,7 +360,7 @@ func (s *Storage) GetListInfoFast(name string) (completed, total int) {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := strings.TrimSpace(scanner.Text())
 		if strings.HasPrefix(line, "[x] ") || strings.HasPrefix(line, "[X] ") {
 			completed++
 			total++
