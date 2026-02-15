@@ -452,6 +452,9 @@ func renderTimeline(layout *TimelineLayout, panelWidth, panelHeight int, selecte
 				check = "✓"
 			}
 			name := item.Task.DisplayContent()
+			if item.IsSubtask {
+				name = "↳ " + name
+			}
 			maxName := panelWidth - lipgloss.Width("  ☐  (no estimate)")
 			if maxName < 10 {
 				maxName = 10
@@ -498,6 +501,9 @@ func renderTimelineSlotRow(slot *TimelineSlot, isFirst, isLast, isMiddle bool, w
 	}
 
 	name := t.DisplayContent()
+	if slot.Item.IsSubtask {
+		name = "↳ " + name
+	}
 
 	if slot.IsPinned {
 		return renderPinnedRow(check, name, timeStr, dur, isFirst, isLast, isMiddle, width)

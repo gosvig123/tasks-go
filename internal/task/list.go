@@ -125,6 +125,11 @@ func (l *TaskList) PendingCount() int {
 		if !t.Completed {
 			count++
 		}
+		for _, sub := range t.Subtasks {
+			if !sub.Completed {
+				count++
+			}
+		}
 	}
 	return count
 }
@@ -134,6 +139,11 @@ func (l *TaskList) CompletedCount() int {
 	for _, t := range l.Tasks {
 		if t.Completed {
 			count++
+		}
+		for _, sub := range t.Subtasks {
+			if sub.Completed {
+				count++
+			}
 		}
 	}
 	return count

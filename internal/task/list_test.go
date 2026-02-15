@@ -90,6 +90,24 @@ func TestToggleParentCascade(t *testing.T) {
 	}
 }
 
+func TestPendingCountWithSubtasks(t *testing.T) {
+	list := NewTaskList("test")
+	parent := &Task{Content: "Parent", Subtasks: []*Task{
+		{Content: "Sub1", Completed: false},
+		{Content: "Sub2", Completed: true},
+	}}
+	list.Add(parent)
+
+	// 1 parent pending + 1 subtask pending = 2
+	if list.PendingCount() != 2 {
+		t.Errorf("expected 2 pending, got %d", list.PendingCount())
+	}
+	// 1 subtask completed = 1
+	if list.CompletedCount() != 1 {
+		t.Errorf("expected 1 completed, got %d", list.CompletedCount())
+	}
+}
+
 func TestToggleParentToIncompleteNoReverse(t *testing.T) {
 	list := NewTaskList("test")
 	parent := &Task{Content: "Parent", Completed: true}
