@@ -17,6 +17,8 @@ type Task struct {
 	Source      string         // For today's list: which list this task came from
 	Estimate    *time.Duration // @est:2h, @est:30m, @est:1h30m
 	StartTime   *TimeOfDay     // @at:09:00, @at:14:30
+	Subtasks    []*Task        // child tasks (single level only)
+	Parent      *Task          // back-pointer to parent (nil for top-level, not serialized)
 }
 
 type TimeOfDay struct {
@@ -137,6 +139,41 @@ func Parse(line string) (*Task, error) {
 	return task, nil
 }
 
+// ParseLines parses multiple lines with indentation-aware subtask grouping.
+// Lines indented with 2 spaces are attached as subtasks to the preceding top-level task.
+// Orphan indented lines (no preceding parent) are treated as top-level tasks.
+func ParseLines(lines []string) []*Task {
+	var tasks []*Task
+	var currentParent *Task
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		isIndented := strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ")
+
+		if isIndented && currentParent != nil {
+			parsed, err := Parse(strings.TrimPrefix(line, "  "))
+			if err != nil {
+				continue
+			}
+			parsed.Parent = currentParent
+			currentParent.Subtasks = append(currentParent.Subtasks, parsed)
+		} else {
+			trimmed := strings.TrimSpace(line)
+			parsed, err := Parse(trimmed)
+			if err != nil {
+				continue
+			}
+			tasks = append(tasks, parsed)
+			currentParent = parsed
+		}
+	}
+
+	return tasks
+}
+
 // String converts the task back to file format
 func (t *Task) String() string {
 	var sb strings.Builder
@@ -192,7 +229,13 @@ func (t *Task) String() string {
 		sb.WriteString(t.CreatedAt.Format("2006-01-02"))
 	}
 
-	return sb.String()
+	result := sb.String()
+	if len(t.Subtasks) > 0 {
+		for _, sub := range t.Subtasks {
+			result += "\n  " + sub.String()
+		}
+	}
+	return result
 }
 
 // StubString serializes only the reference fields for today's list.
@@ -213,7 +256,13 @@ func (t *Task) StubString() string {
 		sb.WriteString(t.Source)
 	}
 
-	return sb.String()
+	result := sb.String()
+	if len(t.Subtasks) > 0 {
+		for _, sub := range t.Subtasks {
+			result += "\n  " + sub.StubString()
+		}
+	}
+	return result
 }
 
 // IsReference returns true if this task is a reference stub (has a source).
@@ -229,6 +278,32 @@ func (t *Task) ResolveFrom(source *Task) {
 	t.StartTime = source.StartTime
 	t.Description = source.Description
 	t.CreatedAt = source.CreatedAt
+
+	// Resolve subtask metadata by matching content
+	for _, sub := range t.Subtasks {
+		subContent := strings.TrimSpace(sub.Content)
+		for _, srcSub := range source.Subtasks {
+			if strings.TrimSpace(srcSub.Content) == subContent {
+				sub.DueDate = srcSub.DueDate
+				sub.RecurDays = srcSub.RecurDays
+				sub.Estimate = srcSub.Estimate
+				sub.StartTime = srcSub.StartTime
+				sub.Description = srcSub.Description
+				sub.CreatedAt = srcSub.CreatedAt
+				break
+			}
+		}
+	}
+}
+
+// AllSubtasksCompleted returns true if all subtasks are completed (or there are none).
+func (t *Task) AllSubtasksCompleted() bool {
+	for _, sub := range t.Subtasks {
+		if !sub.Completed {
+			return false
+		}
+	}
+	return true
 }
 
 // DisplayContent returns the content without metadata for display
