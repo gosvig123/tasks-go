@@ -215,3 +215,68 @@ func TestResolveFromWithSubtasks(t *testing.T) {
 		t.Errorf("expected 45m estimate, got %v", *stub.Subtasks[0].Estimate)
 	}
 }
+
+func TestSubtaskRoundTrip(t *testing.T) {
+	est := 45 * time.Minute
+	parent := &Task{
+		Content: "Write proposal",
+		Subtasks: []*Task{
+			{Content: "Research", Estimate: &est},
+			{Content: "Draft", Completed: true},
+		},
+	}
+
+	// Serialize
+	output := parent.String()
+
+	// Parse back
+	lines := strings.Split(output, "\n")
+	tasks := ParseLines(lines)
+
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 top-level task, got %d", len(tasks))
+	}
+	if len(tasks[0].Subtasks) != 2 {
+		t.Fatalf("expected 2 subtasks after round-trip, got %d", len(tasks[0].Subtasks))
+	}
+	if tasks[0].Subtasks[0].Content != "Research" {
+		t.Errorf("expected 'Research', got '%s'", tasks[0].Subtasks[0].Content)
+	}
+	if tasks[0].Subtasks[0].Estimate == nil || *tasks[0].Subtasks[0].Estimate != est {
+		t.Error("expected estimate to survive round-trip")
+	}
+	if !tasks[0].Subtasks[1].Completed {
+		t.Error("expected completed status to survive round-trip")
+	}
+}
+
+func TestSubtaskStubRoundTrip(t *testing.T) {
+	parent := &Task{
+		Content: "Write proposal",
+		Source:  "work",
+		Subtasks: []*Task{
+			{Content: "Research", Source: "work"},
+			{Content: "Draft", Source: "work", Completed: true},
+		},
+	}
+
+	// Serialize as stub
+	output := parent.StubString()
+
+	// Parse back
+	lines := strings.Split(output, "\n")
+	tasks := ParseLines(lines)
+
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 top-level task, got %d", len(tasks))
+	}
+	if len(tasks[0].Subtasks) != 2 {
+		t.Fatalf("expected 2 subtasks after stub round-trip, got %d", len(tasks[0].Subtasks))
+	}
+	if tasks[0].Subtasks[0].Source != "work" {
+		t.Errorf("expected source 'work', got '%s'", tasks[0].Subtasks[0].Source)
+	}
+	if !tasks[0].Subtasks[1].Completed {
+		t.Error("expected completed status to survive stub round-trip")
+	}
+}
