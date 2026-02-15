@@ -90,6 +90,7 @@ const (
 	InputSearch
 	InputTimelineSetTime     // Inline input for setting start time in timeline
 	InputTimelineSetEstimate // Inline input for setting estimate in timeline
+	InputAddSubtask          // Adding a subtask to focused parent
 )
 
 // TaskItem wraps a task with its source list info
@@ -140,6 +141,9 @@ type TaskViewModel struct {
 	pendingTaskRecur   string
 	pendingTaskEst     string
 	pendingTaskStart   string
+
+	// Subtask state
+	subtaskParentIdx int // index in items[] of the parent being added to
 
 	// Terminal size
 	width  int
@@ -561,6 +565,8 @@ func (m *TaskViewModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleTimelineSetTimeKey(msg)
 	case InputTimelineSetEstimate:
 		return m.handleTimelineSetEstimateKey(msg)
+	case InputAddSubtask:
+		return m.handleAddSubtaskKey(msg)
 	default:
 		return m.handleNormalKey(msg)
 	}
@@ -654,6 +660,18 @@ func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		if (m.viewMode == ViewSingleList || m.viewMode == ViewAllPending) && len(m.items) > 0 {
 			return m, m.startEditTask()
+		}
+
+	case "s":
+		if (m.viewMode == ViewSingleList || m.viewMode == ViewAllPending) && len(m.items) > 0 {
+			item := m.items[m.cursor]
+			// Only allow on top-level tasks (not subtasks)
+			if !item.IsSubtask {
+				m.subtaskParentIdx = m.cursor
+				m.inputMode = InputAddSubtask
+				m.clearFormFields()
+				return m, m.focusFormField(0)
+			}
 		}
 
 	case "c":
@@ -897,7 +915,21 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 		}
 
 		// Find and update the task in the list
-		if item.Index < len(list.Tasks) {
+		if item.IsSubtask {
+			if item.Index < len(list.Tasks) {
+				parent := list.Tasks[item.Index]
+				if item.SubIndex < len(parent.Subtasks) {
+					sub := parent.Subtasks[item.SubIndex]
+					sub.Content = content
+					sub.Description = description
+					sub.DueDate = item.Task.DueDate
+					sub.RecurDays = recurDays
+					sub.Estimate = estimate
+					sub.StartTime = startTime
+				}
+			}
+			m.storage.SaveList(list)
+		} else if item.Index < len(list.Tasks) {
 			list.Tasks[item.Index].Content = content
 			list.Tasks[item.Index].Description = description
 			list.Tasks[item.Index].DueDate = item.Task.DueDate
@@ -1395,6 +1427,119 @@ func (m *TaskViewModel) handleAddTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *TaskViewModel) handleAddSubtaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	const numFields = 6
+
+	switch msg.String() {
+	case "esc":
+		m.inputMode = InputNormal
+		m.textInput.Blur()
+		m.descInput.Blur()
+		m.dueInput.Blur()
+		m.recurInput.Blur()
+		m.estInput.Blur()
+		m.startInput.Blur()
+		m.focusedField = 0
+		return m, nil
+
+	case "tab":
+		nextField := (m.focusedField + 1) % numFields
+		return m, m.focusFormField(nextField)
+
+	case "shift+tab":
+		prevField := (m.focusedField - 1 + numFields) % numFields
+		return m, m.focusFormField(prevField)
+
+	case "enter":
+		content := strings.TrimSpace(m.textInput.Value())
+		if content != "" {
+			m.textInput.Blur()
+			m.descInput.Blur()
+			m.dueInput.Blur()
+			m.recurInput.Blur()
+			m.estInput.Blur()
+			m.startInput.Blur()
+			m.focusedField = 0
+			m.inputMode = InputNormal
+			return m, m.addSubtaskToParent(content, m.descInput.Value(), m.dueInput.Value(), m.recurInput.Value(), m.estInput.Value(), m.startInput.Value())
+		}
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	switch m.focusedField {
+	case 0:
+		m.textInput, cmd = m.textInput.Update(msg)
+	case 1:
+		m.descInput, cmd = m.descInput.Update(msg)
+	case 2:
+		m.dueInput, cmd = m.dueInput.Update(msg)
+	case 3:
+		m.recurInput, cmd = m.recurInput.Update(msg)
+	case 4:
+		m.estInput, cmd = m.estInput.Update(msg)
+	case 5:
+		m.startInput, cmd = m.startInput.Update(msg)
+	}
+	return m, cmd
+}
+
+func (m *TaskViewModel) addSubtaskToParent(content, description, dueValue, recurValue, estValue, startValue string) tea.Cmd {
+	return func() tea.Msg {
+		if m.subtaskParentIdx < 0 || m.subtaskParentIdx >= len(m.items) {
+			return nil
+		}
+
+		parentItem := m.items[m.subtaskParentIdx]
+		estimate := parseEstimateValue(estValue)
+		startTime := parseStartTimeValue(startValue)
+		dueOffset, specificDate := parseDueValue(dueValue)
+		recurDays := parseRecurValue(recurValue)
+
+		now := time.Now()
+		subtask := &task.Task{
+			Content:     content,
+			Description: strings.TrimSpace(description),
+			Completed:   false,
+			RecurDays:   recurDays,
+			Estimate:    estimate,
+			StartTime:   startTime,
+			CreatedAt:   &now,
+		}
+
+		if dueOffset > 0 || recurDays > 0 {
+			offset := dueOffset
+			if offset == 0 && recurDays > 0 {
+				offset = recurDays
+			}
+			due := now.AddDate(0, 0, offset)
+			subtask.DueDate = &due
+		}
+		if specificDate != nil {
+			subtask.DueDate = specificDate
+		}
+
+		if m.viewMode == ViewSingleList && m.taskList != nil {
+			originalIndex := m.taskList.OriginalIndex(parentItem.Task)
+			if originalIndex < 0 {
+				return nil
+			}
+			m.taskList.AddSubtask(originalIndex, subtask)
+			m.storage.SaveList(m.taskList)
+		} else {
+			// All-tasks view
+			list, err := m.storage.LoadList(parentItem.ListName)
+			if err != nil {
+				return nil
+			}
+			list.AddSubtask(parentItem.Index, subtask)
+			m.storage.SaveList(list)
+		}
+
+		return m.loadTasks()()
+	}
+}
+
 func (m *TaskViewModel) handleSelectListForTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q":
@@ -1453,35 +1598,67 @@ func (m *TaskViewModel) toggleTask(idx int) tea.Cmd {
 		item := m.items[idx]
 
 		if m.viewMode == ViewSingleList && m.taskList != nil {
-			// Toggle in current list
-			originalIndex := m.taskList.OriginalIndex(item.Task)
-			if originalIndex < 0 {
-				return nil
-			}
+			if item.IsSubtask {
+				// Toggle subtask
+				parentIdx := m.findParentItemIdx(idx)
+				originalParentIndex := m.taskList.OriginalIndex(m.items[parentIdx].Task)
+				if originalParentIndex < 0 {
+					return nil
+				}
+				m.taskList.ToggleSubtask(originalParentIndex, item.SubIndex)
 
-			toggled := m.taskList.Toggle(originalIndex)
-			m.handleRecurrence(toggled, m.taskList)
+				// Sync parent to source if on today list
+				if m.listName == "today" {
+					parent := m.taskList.Get(originalParentIndex)
+					if parent != nil && parent.Source != "" {
+						m.syncToSource(parent)
+					}
+				}
+			} else {
+				// Toggle parent task (existing logic)
+				originalIndex := m.taskList.OriginalIndex(item.Task)
+				if originalIndex < 0 {
+					return nil
+				}
 
-			if m.listName == "today" && toggled != nil && toggled.Source != "" {
-				m.syncToSource(toggled)
+				toggled := m.taskList.Toggle(originalIndex)
+				m.handleRecurrence(toggled, m.taskList)
+
+				if m.listName == "today" && toggled != nil && toggled.Source != "" {
+					m.syncToSource(toggled)
+				}
 			}
 
 			m.storage.SaveList(m.taskList)
 		} else {
-			// Toggle in source list (all-tasks view)
+			// All-tasks view
 			list, err := m.storage.LoadList(item.ListName)
 			if err != nil {
 				return nil
 			}
 
-			toggled := list.Toggle(item.Index)
-			m.handleRecurrence(toggled, list)
+			if item.IsSubtask {
+				list.ToggleSubtask(item.Index, item.SubIndex)
+			} else {
+				toggled := list.Toggle(item.Index)
+				m.handleRecurrence(toggled, list)
+			}
 
 			m.storage.SaveList(list)
 		}
 
 		return m.loadTasks()()
 	}
+}
+
+// findParentItemIdx walks backwards from a subtask item to find its parent TaskItem index.
+func (m *TaskViewModel) findParentItemIdx(subtaskIdx int) int {
+	for i := subtaskIdx - 1; i >= 0; i-- {
+		if !m.items[i].IsSubtask {
+			return i
+		}
+	}
+	return 0
 }
 
 func (m *TaskViewModel) syncToSource(todayTask *task.Task) {
@@ -1492,9 +1669,18 @@ func (m *TaskViewModel) syncToSource(todayTask *task.Task) {
 
 	todayContent := strings.TrimSpace(todayTask.Content)
 	for _, t := range sourceList.Tasks {
-		// Match by content (trimmed)
 		if strings.TrimSpace(t.Content) == todayContent {
 			t.Completed = todayTask.Completed
+			// Sync subtask completion states
+			for _, todaySub := range todayTask.Subtasks {
+				subContent := strings.TrimSpace(todaySub.Content)
+				for _, srcSub := range t.Subtasks {
+					if strings.TrimSpace(srcSub.Content) == subContent {
+						srcSub.Completed = todaySub.Completed
+						break
+					}
+				}
+			}
 			break
 		}
 	}
@@ -1576,22 +1762,32 @@ func (m *TaskViewModel) deleteTask(idx int) tea.Cmd {
 		item := m.items[idx]
 
 		if m.viewMode == ViewSingleList && m.taskList != nil {
-			// Delete from current list
-			originalIndex := m.taskList.OriginalIndex(item.Task)
-			if originalIndex < 0 {
-				return nil
+			if item.IsSubtask {
+				parentIdx := m.findParentItemIdx(idx)
+				originalParentIndex := m.taskList.OriginalIndex(m.items[parentIdx].Task)
+				if originalParentIndex < 0 {
+					return nil
+				}
+				m.taskList.DeleteSubtask(originalParentIndex, item.SubIndex)
+			} else {
+				originalIndex := m.taskList.OriginalIndex(item.Task)
+				if originalIndex < 0 {
+					return nil
+				}
+				m.taskList.Delete(originalIndex)
 			}
-
-			m.taskList.Delete(originalIndex)
 			m.storage.SaveList(m.taskList)
 		} else {
-			// Delete from source list (all-tasks view)
 			list, err := m.storage.LoadList(item.ListName)
 			if err != nil {
 				return nil
 			}
 
-			list.Delete(item.Index)
+			if item.IsSubtask {
+				list.DeleteSubtask(item.Index, item.SubIndex)
+			} else {
+				list.Delete(item.Index)
+			}
 			m.storage.SaveList(list)
 		}
 
@@ -1885,6 +2081,35 @@ func (m *TaskViewModel) View() string {
 		rightPanel := panelBorderStyle.Width(rightWidth).Render(rightContent)
 
 		// Join panels horizontally
+		splitView := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel)
+		sb.WriteString(splitView)
+
+		return sb.String()
+
+	case InputAddSubtask:
+		// Same split-screen layout as InputAddTask
+		termWidth := m.width
+		if termWidth < 60 {
+			termWidth = 80
+		}
+		leftWidth := (termWidth * 55) / 100
+		rightWidth := termWidth - leftWidth - 3
+		if leftWidth < 30 {
+			leftWidth = 30
+		}
+		if rightWidth < 25 {
+			rightWidth = 25
+		}
+		leftContent := m.renderTaskListPanel(leftWidth)
+		leftPanel := panelBorderStyle.Width(leftWidth).Render(leftContent)
+
+		parentName := ""
+		if m.subtaskParentIdx < len(m.items) {
+			parentName = m.items[m.subtaskParentIdx].Task.DisplayContent()
+		}
+		rightContent := m.renderTaskFormPanel(fmt.Sprintf("Add Subtask to: %s", parentName), "add subtask")
+		rightPanel := panelBorderStyle.Width(rightWidth).Render(rightContent)
+
 		splitView := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel)
 		sb.WriteString(splitView)
 
