@@ -58,7 +58,54 @@ func (l *TaskList) Toggle(index int) *Task {
 		return nil
 	}
 	l.Tasks[index].Completed = !l.Tasks[index].Completed
+
+	// Cascade down: completing a parent completes all subtasks
+	if l.Tasks[index].Completed {
+		for _, sub := range l.Tasks[index].Subtasks {
+			sub.Completed = true
+		}
+	}
+
 	return l.Tasks[index]
+}
+
+// AddSubtask appends a subtask to the parent at the given index.
+func (l *TaskList) AddSubtask(parentIndex int, subtask *Task) *Task {
+	parent := l.Get(parentIndex)
+	if parent == nil {
+		return nil
+	}
+	subtask.Parent = parent
+	parent.Subtasks = append(parent.Subtasks, subtask)
+	return subtask
+}
+
+// DeleteSubtask removes a subtask from the parent at the given indices.
+func (l *TaskList) DeleteSubtask(parentIndex, subIndex int) *Task {
+	parent := l.Get(parentIndex)
+	if parent == nil || subIndex < 0 || subIndex >= len(parent.Subtasks) {
+		return nil
+	}
+	removed := parent.Subtasks[subIndex]
+	parent.Subtasks = append(parent.Subtasks[:subIndex], parent.Subtasks[subIndex+1:]...)
+	return removed
+}
+
+// ToggleSubtask toggles a subtask and auto-completes the parent if all subtasks are done.
+func (l *TaskList) ToggleSubtask(parentIndex, subIndex int) *Task {
+	parent := l.Get(parentIndex)
+	if parent == nil || subIndex < 0 || subIndex >= len(parent.Subtasks) {
+		return nil
+	}
+	sub := parent.Subtasks[subIndex]
+	sub.Completed = !sub.Completed
+
+	// Auto-complete parent if all subtasks are now completed
+	if sub.Completed && parent.AllSubtasksCompleted() {
+		parent.Completed = true
+	}
+
+	return sub
 }
 
 func (l *TaskList) Get(index int) *Task {
