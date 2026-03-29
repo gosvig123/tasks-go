@@ -12,6 +12,7 @@ type Task struct {
 	Description string // Optional description for the task
 	Completed   bool
 	DueDate     *time.Time
+	CompletedAt *time.Time // @done:YYYY-MM-DD — set when task is completed
 	RecurDays   int
 	CreatedAt   *time.Time
 	Source      string         // For today's list: which list this task came from
@@ -36,6 +37,7 @@ func (t TimeOfDay) ToMinutes() int {
 
 var (
 	dueRegex     = regexp.MustCompile(`@due:(\d{4}-\d{2}-\d{2})`)
+	doneRegex    = regexp.MustCompile(`@done:(\d{4}-\d{2}-\d{2})`)
 	recurRegex   = regexp.MustCompile(`@recur:(\d+)`)
 	sourceRegex  = regexp.MustCompile(`@source:([a-zA-Z0-9_-]+)`)
 	descRegex    = regexp.MustCompile(`@desc:"([^"]*)"`)
@@ -85,6 +87,14 @@ func Parse(line string) (*Task, error) {
 			task.DueDate = &t
 		}
 		line = dueRegex.ReplaceAllString(line, "")
+	}
+
+	// Extract completion date
+	if match := doneRegex.FindStringSubmatch(line); len(match) > 1 {
+		if t, err := time.Parse("2006-01-02", match[1]); err == nil {
+			task.CompletedAt = &t
+		}
+		line = doneRegex.ReplaceAllString(line, "")
 	}
 
 	// Extract recur days
@@ -191,6 +201,11 @@ func (t *Task) String() string {
 		sb.WriteString(t.DueDate.Format("2006-01-02"))
 	}
 
+	if t.CompletedAt != nil {
+		sb.WriteString(" @done:")
+		sb.WriteString(t.CompletedAt.Format("2006-01-02"))
+	}
+
 	if t.RecurDays > 0 {
 		sb.WriteString(fmt.Sprintf(" @recur:%d", t.RecurDays))
 	}
@@ -238,58 +253,89 @@ func (t *Task) String() string {
 	return result
 }
 
-// StubString serializes only the reference fields for today's list.
-// The source list is the single truth for metadata like @est, @at, @due, etc.
-func (t *Task) StubString() string {
-	var sb strings.Builder
-
-	if t.Completed {
-		sb.WriteString("[x] ")
-	} else {
-		sb.WriteString("[] ")
-	}
-
-	sb.WriteString(t.Content)
-
-	if t.Source != "" {
-		sb.WriteString(" @source:")
-		sb.WriteString(t.Source)
-	}
-
-	result := sb.String()
-	if len(t.Subtasks) > 0 {
-		for _, sub := range t.Subtasks {
-			result += "\n  " + sub.StubString()
-		}
-	}
-	return result
-}
-
 // IsReference returns true if this task is a reference stub (has a source).
 func (t *Task) IsReference() bool {
 	return t.Source != ""
 }
 
-// ResolveFrom copies metadata from a source task into this reference.
-func (t *Task) ResolveFrom(source *Task) {
-	t.DueDate = source.DueDate
-	t.RecurDays = source.RecurDays
-	t.Estimate = source.Estimate
-	t.StartTime = source.StartTime
-	t.Description = source.Description
-	t.CreatedAt = source.CreatedAt
+// NewReferenceStub creates a reference stub of t for today's list.
+// All metadata is copied so it persists even if resolution fails.
+func NewReferenceStub(t *Task, source string) *Task {
+	stub := &Task{
+		Content:     t.Content,
+		Source:      source,
+		DueDate:     t.DueDate,
+		Estimate:    t.Estimate,
+		StartTime:   t.StartTime,
+		Description: t.Description,
+		RecurDays:   t.RecurDays,
+		CreatedAt:   t.CreatedAt,
+	}
+	for _, sub := range t.Subtasks {
+		stubSub := &Task{
+			Content:   sub.Content,
+			Completed: sub.Completed,
+			Source:    source,
+			Parent:    stub,
+		}
+		stub.Subtasks = append(stub.Subtasks, stubSub)
+	}
+	return stub
+}
 
-	// Resolve subtask metadata by matching content
+// ResolveFrom merges metadata from a source task into this reference.
+// Source is the single truth: completion status and all metadata are
+// copied unconditionally. Nil/zero source values for optional metadata
+// do not overwrite existing stub values (preserving locally-set fields
+// like @est or @at assigned directly on the today task).
+func (t *Task) ResolveFrom(source *Task) {
+	t.Completed = source.Completed
+	t.CompletedAt = source.CompletedAt
+
+	if source.DueDate != nil {
+		t.DueDate = source.DueDate
+	}
+	if source.RecurDays > 0 {
+		t.RecurDays = source.RecurDays
+	}
+	if source.Estimate != nil {
+		t.Estimate = source.Estimate
+	}
+	if source.StartTime != nil {
+		t.StartTime = source.StartTime
+	}
+	if source.Description != "" {
+		t.Description = source.Description
+	}
+	if source.CreatedAt != nil {
+		t.CreatedAt = source.CreatedAt
+	}
+
+	// Resolve subtask metadata + completion by matching content
 	for _, sub := range t.Subtasks {
 		subContent := strings.TrimSpace(sub.Content)
 		for _, srcSub := range source.Subtasks {
 			if strings.TrimSpace(srcSub.Content) == subContent {
-				sub.DueDate = srcSub.DueDate
-				sub.RecurDays = srcSub.RecurDays
-				sub.Estimate = srcSub.Estimate
-				sub.StartTime = srcSub.StartTime
-				sub.Description = srcSub.Description
-				sub.CreatedAt = srcSub.CreatedAt
+				sub.Completed = srcSub.Completed
+				sub.CompletedAt = srcSub.CompletedAt
+				if srcSub.DueDate != nil {
+					sub.DueDate = srcSub.DueDate
+				}
+				if srcSub.RecurDays > 0 {
+					sub.RecurDays = srcSub.RecurDays
+				}
+				if srcSub.Estimate != nil {
+					sub.Estimate = srcSub.Estimate
+				}
+				if srcSub.StartTime != nil {
+					sub.StartTime = srcSub.StartTime
+				}
+				if srcSub.Description != "" {
+					sub.Description = srcSub.Description
+				}
+				if srcSub.CreatedAt != nil {
+					sub.CreatedAt = srcSub.CreatedAt
+				}
 				break
 			}
 		}
@@ -304,11 +350,6 @@ func (t *Task) AllSubtasksCompleted() bool {
 		}
 	}
 	return true
-}
-
-// DisplayContent returns the content without metadata for display
-func (t *Task) DisplayContent() string {
-	return t.Content
 }
 
 // IsDueToday returns true if the task is due today or overdue

@@ -19,15 +19,6 @@ type Storage struct {
 	LastSyncFile    string
 }
 
-func New(tasksDir, currentListFile, lastResetFile, lastSyncFile string) *Storage {
-	return &Storage{
-		TasksDir:        tasksDir,
-		CurrentListFile: currentListFile,
-		LastResetFile:   lastResetFile,
-		LastSyncFile:    lastSyncFile,
-	}
-}
-
 func DefaultStorage() *Storage {
 	home, _ := os.UserHomeDir()
 	return &Storage{
@@ -139,8 +130,77 @@ func (s *Storage) ResolveReferences(todayList *task.TaskList) {
 	}
 }
 
+// SyncCompletionToSource propagates completion status from a today reference
+// task back to its source list. Syncs Completed, CompletedAt, and subtask
+// completion. This is the single function for today→source completion sync;
+// the reverse (source→today) is handled by ResolveFrom on next load.
+func (s *Storage) SyncCompletionToSource(todayTask *task.Task) {
+	if todayTask.Source == "" {
+		return
+	}
+
+	sourceList, err := s.loadListRaw(todayTask.Source)
+	if err != nil {
+		return
+	}
+
+	todayContent := strings.TrimSpace(todayTask.Content)
+	for _, t := range sourceList.Tasks {
+		if strings.TrimSpace(t.Content) == todayContent {
+			t.Completed = todayTask.Completed
+			t.CompletedAt = todayTask.CompletedAt
+			for _, todaySub := range todayTask.Subtasks {
+				subContent := strings.TrimSpace(todaySub.Content)
+				for _, srcSub := range t.Subtasks {
+					if strings.TrimSpace(srcSub.Content) == subContent {
+						srcSub.Completed = todaySub.Completed
+						srcSub.CompletedAt = todaySub.CompletedAt
+						break
+					}
+				}
+			}
+			s.SaveList(sourceList)
+			break
+		}
+	}
+}
+
+// SyncCompletionToToday propagates completion status from a source list task
+// to its matching reference on the today list. This is the reverse of
+// SyncCompletionToSource: when a task is completed on a source list, the
+// today list reference is updated to match.
+func (s *Storage) SyncCompletionToToday(sourceListName string, sourceTask *task.Task) {
+	todayList, err := s.loadListRaw("today")
+	if err != nil {
+		return
+	}
+
+	srcContent := strings.TrimSpace(sourceTask.Content)
+	for _, t := range todayList.Tasks {
+		if t.Source != sourceListName {
+			continue
+		}
+		if strings.TrimSpace(t.Content) != srcContent {
+			continue
+		}
+		t.Completed = sourceTask.Completed
+		t.CompletedAt = sourceTask.CompletedAt
+		for _, srcSub := range sourceTask.Subtasks {
+			subContent := strings.TrimSpace(srcSub.Content)
+			for _, todaySub := range t.Subtasks {
+				if strings.TrimSpace(todaySub.Content) == subContent {
+					todaySub.Completed = srcSub.Completed
+					todaySub.CompletedAt = srcSub.CompletedAt
+					break
+				}
+			}
+		}
+		s.SaveList(todayList)
+		break
+	}
+}
+
 // SaveList saves a task list to disk.
-// For the "today" list, only reference stubs are persisted (no resolved metadata).
 func (s *Storage) SaveList(list *task.TaskList) error {
 	if err := s.EnsureDir(); err != nil {
 		return err
@@ -154,11 +214,7 @@ func (s *Storage) SaveList(list *task.TaskList) error {
 	defer file.Close()
 
 	for _, t := range list.Tasks {
-		if list.Name == "today" && t.IsReference() {
-			fmt.Fprintln(file, t.StubString())
-		} else {
-			fmt.Fprintln(file, t.String())
-		}
+		fmt.Fprintln(file, t.String())
 	}
 
 	return nil
@@ -295,22 +351,7 @@ func (s *Storage) ResetTodayList() (int, error) {
 		}
 
 		for _, t := range list.GetDueTasks() {
-			// Create a reference stub — source list is the single truth
-			todayTask := &task.Task{
-				Content: t.Content,
-				Source:  listName,
-			}
-			// Copy subtasks as reference stubs
-			for _, sub := range t.Subtasks {
-				todaySub := &task.Task{
-					Content:   sub.Content,
-					Completed: sub.Completed,
-					Source:    listName,
-					Parent:    todayTask,
-				}
-				todayTask.Subtasks = append(todayTask.Subtasks, todaySub)
-			}
-			todayList.Add(todayTask)
+			todayList.Add(task.NewReferenceStub(t, listName))
 			addedCount++
 		}
 	}

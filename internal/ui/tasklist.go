@@ -242,6 +242,10 @@ type timelineRefreshMsg struct {
 	cursorIdx int // timeline cursor to restore after refresh (-1 = don't change)
 }
 
+// refreshDisplayMsg signals the timeline to recompute from current in-memory
+// state without resetting the list cursor. Used after in-place task edits.
+type refreshDisplayMsg struct{}
+
 func (m *TaskViewModel) loadTasks() tea.Cmd {
 	return func() tea.Msg {
 		switch m.viewMode {
@@ -501,6 +505,12 @@ func (m *TaskViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.timelineCursor = msg.cursorIdx
 			}
 			m.syncListCursorFromTimeline()
+		}
+		return m, nil
+
+	case refreshDisplayMsg:
+		if m.showTimeline {
+			m.timelineLayout = computeTimelineLayout(m.items, 8, 18)
 		}
 		return m, nil
 	}
@@ -879,42 +889,63 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 
 		item := m.items[m.cursor]
 
-		// Parse due date and recurrence
+		// Parse form values
 		dueOffset, specificDate := parseDueValue(dueValue)
 		recurDays := parseRecurValue(recurValue)
 		estimate := parseEstimateValue(estValue)
 		startTime := parseStartTimeValue(startValue)
 
-		// Update the task
+		// Update the task in-place (item.Task is the same pointer as in m.taskList)
 		item.Task.Content = content
 		item.Task.Description = description
 		item.Task.RecurDays = recurDays
 		item.Task.Estimate = estimate
 		item.Task.StartTime = startTime
 
-		// Update due date
 		if specificDate != nil {
 			item.Task.DueDate = specificDate
 		} else if dueOffset > 0 {
 			due := time.Now().AddDate(0, 0, dueOffset)
 			item.Task.DueDate = &due
 		} else if dueValue == "" {
-			// Clear due date if field is empty
 			item.Task.DueDate = nil
 		}
 
-		// Save to the appropriate list
 		listName := m.listName
 		if m.viewMode == ViewAllPending {
 			listName = item.ListName
 		}
 
+		// ViewSingleList: item.Task is the same pointer as m.taskList.Tasks[item.Index],
+		// so the in-place mutation above already updated m.taskList. Save it directly
+		// and return a lightweight refresh instead of a full disk reload so the cursor
+		// stays on the edited task and the timeline updates immediately.
+		if m.viewMode == ViewSingleList && m.taskList != nil {
+			m.storage.SaveList(m.taskList)
+
+			if listName == "today" && item.Task.IsReference() {
+				m.syncMetadataToSource(item.Task)
+
+				if !item.Task.IsDueToday() {
+					// Task is no longer due today — remove stub and do a full reload
+					// (cursor reset is acceptable since the task disappears from the list)
+					m.taskList.Delete(item.Index)
+					m.storage.SaveList(m.taskList)
+					m.inputMode = InputNormal
+					return m.loadTasks()()
+				}
+			}
+
+			m.inputMode = InputNormal
+			return refreshDisplayMsg{}
+		}
+
+		// ViewAllPending: m.taskList is nil, so load the list fresh from disk
 		list, err := m.storage.LoadList(listName)
 		if err != nil {
 			return nil
 		}
 
-		// Find and update the task in the list
 		if item.IsSubtask {
 			if item.Index < len(list.Tasks) {
 				parent := list.Tasks[item.Index]
@@ -939,11 +970,9 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 			m.storage.SaveList(list)
 		}
 
-		// For today reference tasks, propagate edits to the source list
 		if listName == "today" && item.Task.IsReference() {
 			m.syncMetadataToSource(item.Task)
 
-			// If due date changed to no longer be today, remove from today list
 			if !item.Task.IsDueToday() {
 				if item.Index < len(list.Tasks) {
 					list.Delete(item.Index)
@@ -1611,7 +1640,12 @@ func (m *TaskViewModel) toggleTask(idx int) tea.Cmd {
 				if m.listName == "today" {
 					parent := m.taskList.Get(originalParentIndex)
 					if parent != nil && parent.Source != "" {
-						m.syncToSource(parent)
+						m.storage.SyncCompletionToSource(parent)
+					}
+				} else {
+					parent := m.taskList.Get(originalParentIndex)
+					if parent != nil {
+						m.storage.SyncCompletionToToday(m.listName, parent)
 					}
 				}
 			} else {
@@ -1625,7 +1659,9 @@ func (m *TaskViewModel) toggleTask(idx int) tea.Cmd {
 				m.handleRecurrence(toggled, m.taskList)
 
 				if m.listName == "today" && toggled != nil && toggled.Source != "" {
-					m.syncToSource(toggled)
+					m.storage.SyncCompletionToSource(toggled)
+				} else if m.listName != "today" && toggled != nil {
+					m.storage.SyncCompletionToToday(m.listName, toggled)
 				}
 			}
 
@@ -1639,9 +1675,22 @@ func (m *TaskViewModel) toggleTask(idx int) tea.Cmd {
 
 			if item.IsSubtask {
 				list.ToggleSubtask(item.Index, item.SubIndex)
+				if item.Index >= 0 && item.Index < list.Len() {
+					parent := list.Get(item.Index)
+					if parent != nil && parent.Source != "" {
+						m.storage.SyncCompletionToSource(parent)
+					} else if parent != nil && item.ListName != "today" {
+						m.storage.SyncCompletionToToday(item.ListName, parent)
+					}
+				}
 			} else {
 				toggled := list.Toggle(item.Index)
 				m.handleRecurrence(toggled, list)
+				if toggled != nil && toggled.Source != "" {
+					m.storage.SyncCompletionToSource(toggled)
+				} else if toggled != nil && item.ListName != "today" {
+					m.storage.SyncCompletionToToday(item.ListName, toggled)
+				}
 			}
 
 			m.storage.SaveList(list)
@@ -1659,33 +1708,6 @@ func (m *TaskViewModel) findParentItemIdx(subtaskIdx int) int {
 		}
 	}
 	return 0
-}
-
-func (m *TaskViewModel) syncToSource(todayTask *task.Task) {
-	sourceList, err := m.storage.LoadList(todayTask.Source)
-	if err != nil {
-		return
-	}
-
-	todayContent := strings.TrimSpace(todayTask.Content)
-	for _, t := range sourceList.Tasks {
-		if strings.TrimSpace(t.Content) == todayContent {
-			t.Completed = todayTask.Completed
-			// Sync subtask completion states
-			for _, todaySub := range todayTask.Subtasks {
-				subContent := strings.TrimSpace(todaySub.Content)
-				for _, srcSub := range t.Subtasks {
-					if strings.TrimSpace(srcSub.Content) == subContent {
-						srcSub.Completed = todaySub.Completed
-						break
-					}
-				}
-			}
-			break
-		}
-	}
-
-	m.storage.SaveList(sourceList)
 }
 
 // syncMetadataToSource propagates metadata changes from a today reference
@@ -1778,7 +1800,14 @@ func (m *TaskViewModel) deleteTask(idx int) tea.Cmd {
 			}
 			m.storage.SaveList(m.taskList)
 		} else {
-			list, err := m.storage.LoadList(item.ListName)
+			// If deleting a reference stub from the today list, remove only the stub
+			// (don't touch the source list).
+			listName := item.ListName
+			if item.Task.IsReference() {
+				listName = "today"
+			}
+
+			list, err := m.storage.LoadList(listName)
 			if err != nil {
 				return nil
 			}
@@ -1891,6 +1920,12 @@ func (m *TaskViewModel) addTaskWithOptions(content, description, dueValue, recur
 			if specificDate != nil {
 				t.DueDate = specificDate
 			}
+			// Auto-assign today's date when adding to the today list with no due date
+			if m.listName == "today" && t.DueDate == nil {
+				now := time.Now()
+				today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+				t.DueDate = &today
+			}
 			t.Estimate = estimate
 			t.StartTime = startTime
 			m.storage.SaveList(m.taskList)
@@ -1904,6 +1939,12 @@ func (m *TaskViewModel) addTaskWithOptions(content, description, dueValue, recur
 			if specificDate != nil {
 				t.DueDate = specificDate
 			}
+			// Auto-assign today's date when adding to the today list with no due date
+			if item.ListName == "today" && t.DueDate == nil {
+				now := time.Now()
+				today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+				t.DueDate = &today
+			}
 			t.Estimate = estimate
 			t.StartTime = startTime
 			m.storage.SaveList(list)
@@ -1913,11 +1954,6 @@ func (m *TaskViewModel) addTaskWithOptions(content, description, dueValue, recur
 
 		return m.loadTasks()()
 	}
-}
-
-// addTask is kept for backward compatibility (CLI usage)
-func (m *TaskViewModel) addTask(content string, description string) tea.Cmd {
-	return m.addTaskWithOptions(content, description, "", "", "", "")
 }
 
 func (m *TaskViewModel) addTaskToList(content string, description string, listName string) tea.Cmd {
@@ -1941,6 +1977,12 @@ func (m *TaskViewModel) addTaskToList(content string, description string, listNa
 		t := list.AddContent(content, strings.TrimSpace(description), dueOffset, recurDays)
 		if specificDate != nil {
 			t.DueDate = specificDate
+		}
+		// Auto-assign today's date when adding to the today list with no due date
+		if listName == "today" && t.DueDate == nil {
+			now := time.Now()
+			today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+			t.DueDate = &today
 		}
 		t.Estimate = estimate
 		t.StartTime = startTime
@@ -1968,13 +2010,28 @@ func (m *TaskViewModel) getOrCreateTodayList() *task.TaskList {
 	return todayList
 }
 
-// copyTaskForToday creates a reference stub for adding to today's list.
-// The source list remains the single truth for all metadata.
-func copyTaskForToday(t *task.Task, source string) *task.Task {
-	return &task.Task{
-		Content: t.Content,
-		Source:  source,
+// ensureDueDateOnSource sets today's date on the source task if it has no due date,
+// then persists the change to the source list.
+func (m *TaskViewModel) ensureDueDateOnSource(t *task.Task, sourceList string) {
+	if t.DueDate != nil {
+		return
 	}
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	t.DueDate = &today
+
+	list, err := m.storage.LoadList(sourceList)
+	if err != nil {
+		return
+	}
+	content := strings.TrimSpace(t.Content)
+	for _, src := range list.Tasks {
+		if strings.TrimSpace(src.Content) == content {
+			src.DueDate = t.DueDate
+			break
+		}
+	}
+	m.storage.SaveList(list)
 }
 
 func (m *TaskViewModel) addSelectedToToday() tea.Cmd {
@@ -1987,7 +2044,8 @@ func (m *TaskViewModel) addSelectedToToday() tea.Cmd {
 				continue
 			}
 			item := m.items[idx]
-			todayList.Add(copyTaskForToday(item.Task, item.ListName))
+			m.ensureDueDateOnSource(item.Task, item.ListName)
+			todayList.Add(task.NewReferenceStub(item.Task, item.ListName))
 			added++
 		}
 
@@ -2020,8 +2078,10 @@ func (m *TaskViewModel) addCurrentTaskToToday() tea.Cmd {
 			return nil
 		}
 
+		m.ensureDueDateOnSource(item.Task, sourceList)
+
 		todayList := m.getOrCreateTodayList()
-		todayList.Add(copyTaskForToday(item.Task, sourceList))
+		todayList.Add(task.NewReferenceStub(item.Task, sourceList))
 		m.storage.SaveList(todayList)
 
 		return AddedToTodayMsg{TaskName: item.Task.Content}
@@ -2105,7 +2165,7 @@ func (m *TaskViewModel) View() string {
 
 		parentName := ""
 		if m.subtaskParentIdx < len(m.items) {
-			parentName = m.items[m.subtaskParentIdx].Task.DisplayContent()
+			parentName = m.items[m.subtaskParentIdx].Task.Content
 		}
 		rightContent := m.renderTaskFormPanel(fmt.Sprintf("Add Subtask to: %s", parentName), "add subtask")
 		rightPanel := panelBorderStyle.Width(rightWidth).Render(rightContent)
@@ -2203,8 +2263,8 @@ func (m *TaskViewModel) View() string {
 		listColWidth = maxListLen + 2 // add padding
 	}
 
-	// Fixed widths: cursor(2) + checkbox(2) + due(12) + padding(4)
-	fixedWidth := 20
+	// Fixed widths: cursor(2) + checkbox(2) + date(18) + padding(4)
+	fixedWidth := 26
 	contentWidth := termWidth - fixedWidth - listColWidth
 	if contentWidth < 20 {
 		contentWidth = 20
@@ -2212,10 +2272,10 @@ func (m *TaskViewModel) View() string {
 
 	// Header
 	if m.showLists {
-		header := fmt.Sprintf("   %-*s  %-*s  %s", listColWidth-2, "List", contentWidth, "Task", "Due")
+		header := fmt.Sprintf("   %-*s  %-*s  %s", listColWidth-2, "List", contentWidth, "Task", "Date")
 		sb.WriteString(headerStyle.Render(header))
 	} else {
-		header := fmt.Sprintf("   %-*s  %s", contentWidth, "Task", "Due")
+		header := fmt.Sprintf("   %-*s  %s", contentWidth, "Task", "Date")
 		sb.WriteString(headerStyle.Render(header))
 	}
 	sb.WriteString("\n")
@@ -2306,6 +2366,72 @@ func (m *TaskViewModel) View() string {
 func (m *TaskViewModel) renderTimelineSplitView() string {
 	var sb strings.Builder
 
+	termWidth := m.width
+	if termWidth < 80 {
+		termWidth = 80
+	}
+	termHeight := m.height
+	if termHeight < 15 {
+		termHeight = 30
+	}
+
+	// Width split: task list on left (55%), timeline on right (45%)
+	leftWidth := (termWidth * 55) / 100
+	rightWidth := termWidth - leftWidth - 3 // 3 = 1 gap char + 2 margin
+	if leftWidth < 30 {
+		leftWidth = 30
+	}
+	if rightWidth < 30 {
+		rightWidth = 30
+	}
+
+	// Panel height: full terminal minus overhead rows (title + blank + \n + help)
+	overhead := 5
+	if m.inputMode == InputSearch {
+		overhead += 2
+	}
+	if m.statusMsg != "" {
+		overhead += 1
+	}
+	panelHeight := termHeight - overhead
+	if panelHeight < 5 {
+		panelHeight = 5
+	}
+
+	debugLog.Printf("renderTimelineSplitView: termW=%d termH=%d leftW=%d rightW=%d panelH=%d", termWidth, termHeight, leftWidth, rightWidth, panelHeight)
+
+	// Left panel: task list
+	leftStyle := panelBorderStyle
+	if !m.timelineFocus {
+		leftStyle = focusedPanelBorderStyle
+	}
+	leftContent := m.renderTaskListPanel(leftWidth)
+	leftPanel := leftStyle.Width(leftWidth).Height(panelHeight).Render(leftContent)
+
+	// Right panel: timeline
+	var selectedTask *task.Task
+	if m.cursor >= 0 && m.cursor < len(m.items) {
+		selectedTask = m.items[m.cursor].Task
+	}
+	if m.timelineLayout == nil {
+		m.timelineLayout = computeTimelineLayout(m.items, 8, 18)
+	}
+	timelineContentWidth := rightWidth - 2
+	if timelineContentWidth < 10 {
+		timelineContentWidth = 10
+	}
+	timelineContentHeight := panelHeight - 2
+	if timelineContentHeight < 1 {
+		timelineContentHeight = 1
+	}
+	timelineContent := renderTimeline(m.timelineLayout, timelineContentWidth, timelineContentHeight, selectedTask, time.Now())
+
+	rightStyle := panelBorderStyle
+	if m.timelineFocus {
+		rightStyle = focusedPanelBorderStyle
+	}
+	rightPanel := rightStyle.Width(rightWidth).Height(panelHeight).Render(timelineContent)
+
 	// Title
 	sb.WriteString(titleStyle.Render(m.getTitle()))
 	sb.WriteString("\n\n")
@@ -2318,99 +2444,8 @@ func (m *TaskViewModel) renderTimelineSplitView() string {
 		sb.WriteString("\n\n")
 	}
 
-	termWidth := m.width
-	if termWidth < 60 {
-		termWidth = 80
-	}
-	termHeight := m.height
-	if termHeight < 10 {
-		termHeight = 30
-	}
-
-	// Full-width panel (minus small margin)
-	panelWidth := termWidth - 4
-	if panelWidth < 40 {
-		panelWidth = 40
-	}
-
-	debugLog.Printf("renderTimelineSplitView: termW=%d termH=%d panelW=%d items=%d", termWidth, termHeight, panelWidth, len(m.items))
-
-	// Calculate overhead: title(2) + search(2?) + status(1) + help(1) + gaps(2) + borders(4 for 2 panels)
-	overhead := 10
-	if m.inputMode == InputSearch {
-		overhead += 2
-	}
-	if m.statusMsg != "" {
-		overhead += 1
-	}
-
-	// Available height for both panels (subtract overhead for title, help, borders, gaps)
-	usableHeight := termHeight - overhead
-
-	// Render task list content and measure its natural height
-	taskListContent := m.renderTaskListPanel(panelWidth)
-	taskListLines := lipgloss.Height(taskListContent)
-	if taskListLines < 1 {
-		taskListLines = 1
-	}
-
-	// Cap task list to at most 40% of usable space so timeline always gets room
-	maxTaskListHeight := usableHeight * 40 / 100
-	if maxTaskListHeight < 3 {
-		maxTaskListHeight = 3
-	}
-	taskListHeight := taskListLines
-	if taskListHeight > maxTaskListHeight {
-		taskListHeight = maxTaskListHeight
-	}
-
-	debugLog.Printf("  usableH=%d taskListLines=%d taskListH=%d maxTaskListH=%d", usableHeight, taskListLines, taskListHeight, maxTaskListHeight)
-
-	// Timeline gets the remaining space (accounting for borders: 2 per panel + 1 gap)
-	timelineHeight := usableHeight - taskListHeight - 5
-	if timelineHeight < 5 {
-		timelineHeight = 5
-	}
-
-	// Render task list panel
-	topStyle := panelBorderStyle
-	if !m.timelineFocus {
-		topStyle = focusedPanelBorderStyle
-	}
-	topPanel := topStyle.Width(panelWidth).Height(taskListHeight).Render(taskListContent)
-
-	// Render timeline panel
-	var selectedTask *task.Task
-	if m.cursor >= 0 && m.cursor < len(m.items) {
-		selectedTask = m.items[m.cursor].Task
-	}
-
-	if m.timelineLayout == nil {
-		m.timelineLayout = computeTimelineLayout(m.items, 8, 18)
-	}
-
-	debugLog.Printf("  timelineH=%d contentW=%d", timelineHeight, panelWidth-2)
-
-	timelineContentHeight := timelineHeight - 2
-	if timelineContentHeight < 1 {
-		timelineContentHeight = 1
-	}
-	timelineContentWidth := panelWidth - 2
-	if timelineContentWidth < 10 {
-		timelineContentWidth = 10
-	}
-	timelineContent := renderTimeline(m.timelineLayout, timelineContentWidth, timelineContentHeight, selectedTask, time.Now())
-
-	bottomStyle := panelBorderStyle
-	if m.timelineFocus {
-		bottomStyle = focusedPanelBorderStyle
-	}
-	bottomPanel := bottomStyle.Width(panelWidth).Height(timelineHeight).Render(timelineContent)
-
-	// Stack vertically
-	sb.WriteString(topPanel)
-	sb.WriteString("\n")
-	sb.WriteString(bottomPanel)
+	// Panels side by side
+	sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel))
 
 	// Status message
 	if m.statusMsg != "" {
@@ -2456,7 +2491,7 @@ func (m *TaskViewModel) renderTaskListPanel(panelWidth int) string {
 		listColWidth = maxListLen + 2
 	}
 
-	fixedWidth := 20
+	fixedWidth := 26
 	contentWidth := panelWidth - fixedWidth - listColWidth
 	if contentWidth < 15 {
 		contentWidth = 15
@@ -2464,10 +2499,10 @@ func (m *TaskViewModel) renderTaskListPanel(panelWidth int) string {
 
 	// Header
 	if m.showLists {
-		header := fmt.Sprintf("   %-*s  %-*s  %s", listColWidth-2, "List", contentWidth, "Task", "Due")
+		header := fmt.Sprintf("   %-*s  %-*s  %s", listColWidth-2, "List", contentWidth, "Task", "Date")
 		sb.WriteString(headerStyle.Render(header))
 	} else {
-		header := fmt.Sprintf("   %-*s  %s", contentWidth, "Task", "Due")
+		header := fmt.Sprintf("   %-*s  %s", contentWidth, "Task", "Date")
 		sb.WriteString(headerStyle.Render(header))
 	}
 	sb.WriteString("\n")
@@ -2606,11 +2641,18 @@ func (m *TaskViewModel) renderTaskDetailPanel(panelWidth int) string {
 	sb.WriteString(normalStyle.Render(status))
 	sb.WriteString("\n\n")
 
+	// Completion date
+	if t.Completed && t.CompletedAt != nil {
+		sb.WriteString(headerStyle.Render("Completed on: "))
+		sb.WriteString(normalStyle.Render(t.CompletedAt.Format("2006-01-02")))
+		sb.WriteString("\n\n")
+	}
+
 	// Content
 	sb.WriteString(headerStyle.Render("Task:"))
 	sb.WriteString("\n")
 	// Word wrap content to fit panel
-	content := t.DisplayContent()
+	content := t.Content
 	maxWidth := panelWidth - 4
 	if maxWidth < 20 {
 		maxWidth = 20
@@ -2759,11 +2801,13 @@ func (m *TaskViewModel) renderTaskLine(idx int, item TaskItem, contentWidth int,
 	}
 
 	due := ""
-	if item.Task.DueDate != nil {
+	if item.Task.Completed && item.Task.CompletedAt != nil {
+		due = "Done: " + item.Task.CompletedAt.Format("2006-01-02")
+	} else if item.Task.DueDate != nil {
 		due = item.Task.DueDate.Format("2006-01-02")
 	}
 
-	content := item.Task.DisplayContent()
+	content := item.Task.Content
 
 	// Add subtask progress indicator for parent tasks
 	if !item.IsSubtask && len(item.Task.Subtasks) > 0 {

@@ -57,16 +57,21 @@ func (l *TaskList) Toggle(index int) *Task {
 	if index < 0 || index >= len(l.Tasks) {
 		return nil
 	}
-	l.Tasks[index].Completed = !l.Tasks[index].Completed
+	t := l.Tasks[index]
+	t.Completed = !t.Completed
 
-	// Cascade down: completing a parent completes all subtasks
-	if l.Tasks[index].Completed {
-		for _, sub := range l.Tasks[index].Subtasks {
+	now := time.Now()
+	if t.Completed {
+		t.CompletedAt = &now
+		for _, sub := range t.Subtasks {
 			sub.Completed = true
+			sub.CompletedAt = &now
 		}
+	} else {
+		t.CompletedAt = nil
 	}
 
-	return l.Tasks[index]
+	return t
 }
 
 // AddSubtask appends a subtask to the parent at the given index.
@@ -100,9 +105,15 @@ func (l *TaskList) ToggleSubtask(parentIndex, subIndex int) *Task {
 	sub := parent.Subtasks[subIndex]
 	sub.Completed = !sub.Completed
 
-	// Auto-complete parent if all subtasks are now completed
-	if sub.Completed && parent.AllSubtasksCompleted() {
-		parent.Completed = true
+	now := time.Now()
+	if sub.Completed {
+		sub.CompletedAt = &now
+		if parent.AllSubtasksCompleted() {
+			parent.Completed = true
+			parent.CompletedAt = &now
+		}
+	} else {
+		sub.CompletedAt = nil
 	}
 
 	return sub

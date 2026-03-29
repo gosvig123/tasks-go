@@ -80,23 +80,23 @@ func TestStringWithoutSubtasks(t *testing.T) {
 	}
 }
 
-func TestStubStringWithSubtasks(t *testing.T) {
+func TestStringReferenceWithSubtasks(t *testing.T) {
 	parent := &Task{Content: "Write proposal", Source: "work"}
 	parent.Subtasks = []*Task{
 		{Content: "Research", Source: "work"},
 		{Content: "Draft", Source: "work", Completed: true},
 	}
 
-	result := parent.StubString()
+	result := parent.String()
 
-	if !strings.HasPrefix(result, "[] Write proposal @source:work") {
-		t.Errorf("expected parent stub line, got: %s", result)
+	if !strings.Contains(result, "[] Write proposal") || !strings.Contains(result, "@source:work") {
+		t.Errorf("expected parent line with source, got: %s", result)
 	}
 	if !strings.Contains(result, "\n  [] Research @source:work") {
-		t.Errorf("expected indented subtask stub: %s", result)
+		t.Errorf("expected indented subtask: %s", result)
 	}
 	if !strings.Contains(result, "\n  [x] Draft @source:work") {
-		t.Errorf("expected indented completed subtask stub: %s", result)
+		t.Errorf("expected indented completed subtask: %s", result)
 	}
 }
 
@@ -216,6 +216,40 @@ func TestResolveFromWithSubtasks(t *testing.T) {
 	}
 }
 
+func TestResolveFromSyncsCompletion(t *testing.T) {
+	sourceCompletedAt, _ := time.Parse("2006-01-02", "2026-02-20")
+	source := &Task{
+		Content:     "Write proposal",
+		Completed:   true,
+		CompletedAt: &sourceCompletedAt,
+		Subtasks: []*Task{
+			{Content: "Research", Completed: true, CompletedAt: &sourceCompletedAt},
+		},
+	}
+
+	stub := &Task{
+		Content:  "Write proposal",
+		Source:   "work",
+		Subtasks: []*Task{{Content: "Research", Source: "work"}},
+	}
+
+	stub.ResolveFrom(source)
+
+	// Source is single truth — completion status is copied
+	if !stub.Completed {
+		t.Error("expected stub Completed to match source")
+	}
+	if stub.CompletedAt.Format("2006-01-02") != "2026-02-20" {
+		t.Errorf("expected stub CompletedAt from source 2026-02-20, got %s", stub.CompletedAt.Format("2006-01-02"))
+	}
+	if !stub.Subtasks[0].Completed {
+		t.Error("expected subtask Completed to match source")
+	}
+	if stub.Subtasks[0].CompletedAt.Format("2006-01-02") != "2026-02-20" {
+		t.Errorf("expected subtask CompletedAt from source 2026-02-20, got %s", stub.Subtasks[0].CompletedAt.Format("2006-01-02"))
+	}
+}
+
 func TestSubtaskRoundTrip(t *testing.T) {
 	est := 45 * time.Minute
 	parent := &Task{
@@ -250,7 +284,73 @@ func TestSubtaskRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSubtaskStubRoundTrip(t *testing.T) {
+func TestParseCompletedAt(t *testing.T) {
+	t.Run("parses @done tag", func(t *testing.T) {
+		task, err := Parse("[x] Finish report @done:2026-02-18")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if task.CompletedAt == nil {
+			t.Fatal("expected CompletedAt to be set")
+		}
+		if task.CompletedAt.Format("2006-01-02") != "2026-02-18" {
+			t.Errorf("expected '2026-02-18', got '%s'", task.CompletedAt.Format("2006-01-02"))
+		}
+	})
+
+	t.Run("no @done tag leaves CompletedAt nil", func(t *testing.T) {
+		task, err := Parse("[x] Finish report")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if task.CompletedAt != nil {
+			t.Errorf("expected CompletedAt nil, got %v", task.CompletedAt)
+		}
+	})
+
+	t.Run("@done tag coexists with other tags", func(t *testing.T) {
+		task, err := Parse("[x] Finish report @due:2026-01-15 @done:2026-02-18 || 2026-01-01")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if task.CompletedAt == nil {
+			t.Fatal("expected CompletedAt to be set")
+		}
+		if task.DueDate == nil {
+			t.Fatal("expected DueDate to be set")
+		}
+		if task.CreatedAt == nil {
+			t.Fatal("expected CreatedAt to be set")
+		}
+	})
+}
+
+func TestStringWithCompletedAt(t *testing.T) {
+	completedAt, _ := time.Parse("2006-01-02", "2026-02-18")
+	task := &Task{Content: "Finish report", Completed: true, CompletedAt: &completedAt}
+	result := task.String()
+	if !strings.Contains(result, "@done:2026-02-18") {
+		t.Errorf("expected @done tag in output, got: %s", result)
+	}
+}
+
+func TestRoundTripWithCompletedAt(t *testing.T) {
+	completedAt, _ := time.Parse("2006-01-02", "2026-02-18")
+	original := &Task{Content: "Finish report", Completed: true, CompletedAt: &completedAt}
+	serialized := original.String()
+	parsed, err := Parse(serialized)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.CompletedAt == nil {
+		t.Fatal("expected CompletedAt after round-trip")
+	}
+	if parsed.CompletedAt.Format("2006-01-02") != "2026-02-18" {
+		t.Errorf("expected '2026-02-18' after round-trip, got '%s'", parsed.CompletedAt.Format("2006-01-02"))
+	}
+}
+
+func TestSubtaskReferenceRoundTrip(t *testing.T) {
 	parent := &Task{
 		Content: "Write proposal",
 		Source:  "work",
@@ -260,8 +360,8 @@ func TestSubtaskStubRoundTrip(t *testing.T) {
 		},
 	}
 
-	// Serialize as stub
-	output := parent.StubString()
+	// Serialize and parse back
+	output := parent.String()
 
 	// Parse back
 	lines := strings.Split(output, "\n")

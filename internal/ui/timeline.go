@@ -451,7 +451,7 @@ func renderTimeline(layout *TimelineLayout, panelWidth, panelHeight int, selecte
 			if item.Task.Completed {
 				check = "✓"
 			}
-			name := item.Task.DisplayContent()
+			name := item.Task.Content
 			if item.IsSubtask {
 				name = "↳ " + name
 			}
@@ -500,7 +500,7 @@ func renderTimelineSlotRow(slot *TimelineSlot, isFirst, isLast, isMiddle bool, w
 		timeStr = fmt.Sprintf("  %s ", t.StartTime.String())
 	}
 
-	name := t.DisplayContent()
+	name := t.Content
 	if slot.Item.IsSubtask {
 		name = "↳ " + name
 	}

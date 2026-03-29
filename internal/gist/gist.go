@@ -244,11 +244,3 @@ func (c *Client) getGist() (*Gist, error) {
 	url := fmt.Sprintf("%s/gists/%s", githubAPIURL, c.config.GistID)
 	return c.doGistRequest("GET", url, nil, http.StatusOK)
 }
-
-// GetGistURL returns the URL of the configured gist
-func (c *Client) GetGistURL() string {
-	if c.config == nil || c.config.GistID == "" {
-		return ""
-	}
-	return fmt.Sprintf("https://gist.github.com/%s", c.config.GistID)
-}

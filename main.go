@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/krisitan/tasks-go/internal/gist"
 	"github.com/krisitan/tasks-go/internal/storage"
@@ -180,69 +181,8 @@ func listPlain() {
 			recur = fmt.Sprintf(" 🔁%dd", t.RecurDays)
 		}
 
-		fmt.Printf("  %d/%d. %s %s%s%s\n", i+1, total, check, t.DisplayContent(), due, recur)
+		fmt.Printf("  %d/%d. %s %s%s%s\n", i+1, total, check, t.Content, due, recur)
 	}
-}
-
-func listAll() {
-	lists, err := store.GetAllLists()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting lists: %v\n", err)
-		os.Exit(1)
-	}
-
-	currentList := store.GetCurrentList()
-	totalTasks := 0
-	totalCompleted := 0
-
-	fmt.Println("📋 All Tasks from All Lists")
-	fmt.Println()
-
-	for _, listName := range lists {
-		list, err := store.LoadList(listName)
-		if err != nil {
-			continue
-		}
-
-		if list.Len() == 0 {
-			continue
-		}
-
-		marker := ""
-		if listName == currentList {
-			marker = " *"
-		}
-
-		completed := list.CompletedCount()
-		total := list.Len()
-		totalTasks += total
-		totalCompleted += completed
-
-		fmt.Printf("── %s (%d/%d)%s ──\n", listName, completed, total, marker)
-
-		tasks := list.SortedTasks()
-		for i, t := range tasks {
-			check := "[]"
-			if t.Completed {
-				check = "[x]"
-			}
-
-			due := ""
-			if t.DueDate != nil {
-				due = fmt.Sprintf(" (due: %s)", t.DueDate.Format("2006-01-02"))
-			}
-
-			recur := ""
-			if t.RecurDays > 0 {
-				recur = fmt.Sprintf(" 🔁%dd", t.RecurDays)
-			}
-
-			fmt.Printf("  %d/%d. %s %s%s%s\n", i+1, total, check, t.DisplayContent(), due, recur)
-		}
-		fmt.Println()
-	}
-
-	fmt.Printf("Total: %d/%d tasks completed\n", totalCompleted, totalTasks)
 }
 
 func addTask(content string) {
@@ -274,7 +214,14 @@ func addTask(content string) {
 		}
 	}
 
-	list.AddContent(content, "", dueOffset, recurDays)
+	t := list.AddContent(content, "", dueOffset, recurDays)
+
+	// Auto-assign today's date when adding to the today list with no due date
+	if currentList == "today" && t.DueDate == nil {
+		now := time.Now()
+		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		t.DueDate = &today
+	}
 
 	if err := store.SaveList(list); err != nil {
 		fmt.Fprintf(os.Stderr, "Error saving list: %v\n", err)
@@ -323,7 +270,7 @@ func deleteTask(indexStr string) {
 		}
 		deleted := list.Delete(idx)
 		if deleted != nil {
-			fmt.Printf("✅ Deleted: %s\n", deleted.DisplayContent())
+			fmt.Printf("✅ Deleted: %s\n", deleted.Content)
 		}
 	}
 
@@ -370,15 +317,17 @@ func toggleTask(indexStr string) {
 					fmt.Printf("   ↳ Next occurrence added to '%s'\n", addedTo)
 				}
 			}
-
-			// Sync to source if from today's list
-			if currentList == "today" && toggled.Source != "" {
-				syncToSource(toggled)
-				fmt.Printf("   ↳ Synced to '%s'\n", toggled.Source)
-			}
 		}
 
-		fmt.Printf("%s: %s\n", status, toggled.DisplayContent())
+		// Sync completion to source (both complete and uncomplete)
+		if currentList == "today" && toggled.Source != "" {
+			store.SyncCompletionToSource(toggled)
+			fmt.Printf("   ↳ Synced to '%s'\n", toggled.Source)
+		} else if currentList != "today" {
+			store.SyncCompletionToToday(currentList, toggled)
+		}
+
+		fmt.Printf("%s: %s\n", status, toggled.Content)
 	}
 
 	if err := store.SaveList(list); err != nil {
@@ -423,22 +372,6 @@ func handleRecurrence(toggled *task.Task, currentList *task.TaskList) string {
 	// Task is in its home list - add recurrence to current list
 	currentList.Add(nextTask)
 	return "current"
-}
-
-func syncToSource(todayTask *task.Task) {
-	sourceList, err := store.LoadList(todayTask.Source)
-	if err != nil {
-		return
-	}
-
-	for _, t := range sourceList.Tasks {
-		if t.Content == todayTask.Content {
-			t.Completed = todayTask.Completed
-			break
-		}
-	}
-
-	store.SaveList(sourceList)
 }
 
 func handleListCommand(args []string) {
@@ -669,13 +602,6 @@ func debugAllTasks() {
 			}
 		}
 	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // dailyRefresh performs all daily maintenance tasks:

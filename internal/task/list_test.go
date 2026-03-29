@@ -1,6 +1,8 @@
 package task
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestAddSubtask(t *testing.T) {
 	list := NewTaskList("test")
@@ -105,6 +107,73 @@ func TestPendingCountWithSubtasks(t *testing.T) {
 	// 1 subtask completed = 1
 	if list.CompletedCount() != 1 {
 		t.Errorf("expected 1 completed, got %d", list.CompletedCount())
+	}
+}
+
+func TestToggleSetsCompletedAt(t *testing.T) {
+	list := NewTaskList("test")
+	list.Add(&Task{Content: "Do thing"})
+
+	toggled := list.Toggle(0)
+
+	if toggled == nil {
+		t.Fatal("expected toggled task")
+	}
+	if !toggled.Completed {
+		t.Error("expected task to be completed")
+	}
+	if toggled.CompletedAt == nil {
+		t.Error("expected CompletedAt to be set when completing")
+	}
+}
+
+func TestToggleClearsCompletedAt(t *testing.T) {
+	list := NewTaskList("test")
+	list.Add(&Task{Content: "Do thing", Completed: true})
+
+	toggled := list.Toggle(0)
+
+	if toggled.Completed {
+		t.Error("expected task to be incomplete")
+	}
+	if toggled.CompletedAt != nil {
+		t.Error("expected CompletedAt to be cleared when un-completing")
+	}
+}
+
+func TestToggleSubtaskSetsCompletedAt(t *testing.T) {
+	list := NewTaskList("test")
+	parent := &Task{Content: "Parent"}
+	list.Add(parent)
+	parent.Subtasks = []*Task{
+		{Content: "Sub1", Completed: false, Parent: parent},
+	}
+
+	sub := list.ToggleSubtask(0, 0)
+
+	if sub == nil {
+		t.Fatal("expected toggled subtask")
+	}
+	if sub.CompletedAt == nil {
+		t.Error("expected CompletedAt to be set on subtask when completing")
+	}
+}
+
+func TestToggleCascadeSetsCompletedAt(t *testing.T) {
+	list := NewTaskList("test")
+	parent := &Task{Content: "Parent"}
+	list.Add(parent)
+	parent.Subtasks = []*Task{
+		{Content: "Sub1", Completed: false, Parent: parent},
+		{Content: "Sub2", Completed: false, Parent: parent},
+	}
+
+	list.Toggle(0)
+
+	for i, sub := range parent.Subtasks {
+		if sub.CompletedAt == nil {
+			t.Errorf("expected CompletedAt on subtask %d after cascade complete", i)
+		}
 	}
 }
 
