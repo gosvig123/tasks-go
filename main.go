@@ -7,15 +7,18 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/krisitan/tasks-go/internal/gist"
 	"github.com/krisitan/tasks-go/internal/storage"
-	"github.com/krisitan/tasks-go/internal/task"
 	"github.com/krisitan/tasks-go/internal/ui"
 )
 
-var store *storage.Storage
+var (
+	store *storage.Storage
+
+	dueOffsetRe   = regexp.MustCompile(`\s+\+(\d+)(r)?$`)
+	validListName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+)
 
 func main() {
 	store = storage.DefaultStorage()
@@ -199,13 +202,12 @@ func addTask(content string) {
 	displayContent := content
 
 	// Check for +Nr (recurring) or +N (due date)
-	re := regexp.MustCompile(`\s+\+(\d+)(r)?$`)
-	if match := re.FindStringSubmatch(content); len(match) > 1 {
+	if match := dueOffsetRe.FindStringSubmatch(content); len(match) > 1 {
 		dueOffset, _ = strconv.Atoi(match[1])
 		if match[2] == "r" {
 			recurDays = dueOffset
 		}
-		content = strings.TrimSpace(re.ReplaceAllString(content, ""))
+		content = strings.TrimSpace(dueOffsetRe.ReplaceAllString(content, ""))
 		displayContent = content
 		if recurDays > 0 {
 			displayContent += fmt.Sprintf(" (every %dd)", recurDays)
@@ -217,10 +219,8 @@ func addTask(content string) {
 	t := list.AddContent(content, "", dueOffset, recurDays)
 
 	// Auto-assign today's date when adding to the today list with no due date
-	if currentList == "today" && t.DueDate == nil {
-		now := time.Now()
-		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-		t.DueDate = &today
+	if currentList == "today" {
+		t.EnsureDueToday()
 	}
 
 	if err := store.SaveList(list); err != nil {
@@ -261,14 +261,34 @@ func deleteTask(indexStr string) {
 		os.Exit(1)
 	}
 
-	// Delete in reverse order to maintain correct indices
-	for i := len(indices) - 1; i >= 0; i-- {
-		idx := indices[i]
-		if idx < 0 || idx >= list.Len() {
-			fmt.Printf("Index %d out of range\n", idx)
+	sorted := list.SortedTasks()
+
+	// Map user's sorted indices to original indices
+	type deleteEntry struct {
+		origIdx int
+		content string
+	}
+	var entries []deleteEntry
+	for _, userIdx := range indices {
+		si := userIdx - 1
+		if si < 0 || si >= len(sorted) {
+			fmt.Printf("Index %d out of range\n", userIdx)
 			continue
 		}
-		deleted := list.Delete(idx)
+		origIdx := list.OriginalIndex(sorted[si])
+		entries = append(entries, deleteEntry{origIdx, sorted[si].Content})
+	}
+
+	// Delete highest original index first to avoid shift
+	for i := 0; i < len(entries); i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[j].origIdx > entries[i].origIdx {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+	for _, e := range entries {
+		deleted := list.Delete(e.origIdx)
 		if deleted != nil {
 			fmt.Printf("✅ Deleted: %s\n", deleted.Content)
 		}
@@ -294,13 +314,17 @@ func toggleTask(indexStr string) {
 		os.Exit(1)
 	}
 
-	for _, idx := range indices {
-		if idx < 0 || idx >= list.Len() {
-			fmt.Printf("Index %d out of range\n", idx)
+	sorted := list.SortedTasks()
+
+	for _, userIdx := range indices {
+		si := userIdx - 1
+		if si < 0 || si >= len(sorted) {
+			fmt.Printf("Index %d out of range\n", userIdx)
 			continue
 		}
+		origIdx := list.OriginalIndex(sorted[si])
 
-		toggled := list.Toggle(idx)
+		toggled := list.Toggle(origIdx)
 		if toggled == nil {
 			continue
 		}
@@ -309,9 +333,8 @@ func toggleTask(indexStr string) {
 		if toggled.Completed {
 			status = "✅ Completed"
 
-			// Handle recurring tasks
-			if addedTo := handleRecurrence(toggled, list); addedTo != "" {
-				if addedTo == "current" {
+			if addedTo := store.HandleRecurrence(toggled, list); addedTo != "" {
+				if addedTo == currentList {
 					fmt.Println("   ↳ Next occurrence created")
 				} else {
 					fmt.Printf("   ↳ Next occurrence added to '%s'\n", addedTo)
@@ -334,44 +357,6 @@ func toggleTask(indexStr string) {
 		fmt.Fprintf(os.Stderr, "Error saving list: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-// handleRecurrence creates the next occurrence for a recurring task.
-// For tasks from today list (with Source), it checks if source is already completed
-// to avoid duplicate recurrences. Returns the target list name if recurrence was added.
-func handleRecurrence(toggled *task.Task, currentList *task.TaskList) string {
-	if toggled == nil || !toggled.Completed || toggled.RecurDays <= 0 {
-		return ""
-	}
-
-	nextTask := toggled.CreateNextRecurrence()
-	if nextTask == nil {
-		return ""
-	}
-
-	if toggled.Source != "" {
-		// Task is from today list - add recurrence to source list
-		// but only if source task isn't already completed (to avoid duplicates)
-		sourceList, err := store.LoadList(toggled.Source)
-		if err != nil {
-			return ""
-		}
-
-		for _, t := range sourceList.Tasks {
-			if t.Content == toggled.Content && t.Completed {
-				// Source already completed, recurrence was already created
-				return ""
-			}
-		}
-
-		sourceList.Add(nextTask)
-		store.SaveList(sourceList)
-		return toggled.Source
-	}
-
-	// Task is in its home list - add recurrence to current list
-	currentList.Add(nextTask)
-	return "current"
 }
 
 func handleListCommand(args []string) {
@@ -465,8 +450,7 @@ func showLists() {
 
 func createList(name string) {
 	// Validate name
-	validName := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-	if !validName.MatchString(name) {
+	if !validListName.MatchString(name) {
 		fmt.Println("❌ List name can only contain letters, numbers, hyphens, and underscores")
 		os.Exit(1)
 	}
@@ -538,8 +522,7 @@ func renameList(oldName, newName string) {
 	}
 
 	// Validate new name
-	validName := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-	if !validName.MatchString(newName) {
+	if !validListName.MatchString(newName) {
 		fmt.Println("❌ List name can only contain letters, numbers, hyphens, and underscores")
 		os.Exit(1)
 	}

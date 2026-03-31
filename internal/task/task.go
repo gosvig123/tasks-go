@@ -253,6 +253,20 @@ func (t *Task) String() string {
 	return result
 }
 
+// TodayDate returns today's date at local midnight.
+func TodayDate() time.Time {
+	now := time.Now()
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+}
+
+// EnsureDueToday sets the task's due date to today if it's nil.
+func (t *Task) EnsureDueToday() {
+	if t.DueDate == nil {
+		d := TodayDate()
+		t.DueDate = &d
+	}
+}
+
 // IsReference returns true if this task is a reference stub (has a source).
 func (t *Task) IsReference() bool {
 	return t.Source != ""
@@ -357,9 +371,10 @@ func (t *Task) IsDueToday() bool {
 	if t.DueDate == nil {
 		return false
 	}
-	today := time.Now().Truncate(24 * time.Hour)
-	due := t.DueDate.Truncate(24 * time.Hour)
-	return !due.After(today)
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	dueLocal := time.Date(t.DueDate.Year(), t.DueDate.Month(), t.DueDate.Day(), 0, 0, 0, 0, now.Location())
+	return !dueLocal.After(today)
 }
 
 // CreateNextRecurrence creates the next occurrence of a recurring task

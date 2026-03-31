@@ -17,6 +17,8 @@ type Storage struct {
 	CurrentListFile string
 	LastResetFile   string
 	LastSyncFile    string
+	resetDoneToday  bool
+	syncDoneToday   bool
 }
 
 func DefaultStorage() *Storage {
@@ -159,7 +161,9 @@ func (s *Storage) SyncCompletionToSource(todayTask *task.Task) {
 					}
 				}
 			}
-			s.SaveList(sourceList)
+			if err := s.SaveList(sourceList); err != nil {
+				fmt.Fprintf(os.Stderr, "Error saving list %s: %v\n", sourceList.Name, err)
+			}
 			break
 		}
 	}
@@ -195,29 +199,80 @@ func (s *Storage) SyncCompletionToToday(sourceListName string, sourceTask *task.
 				}
 			}
 		}
-		s.SaveList(todayList)
+		if err := s.SaveList(todayList); err != nil {
+			fmt.Fprintf(os.Stderr, "Error saving list %s: %v\n", todayList.Name, err)
+		}
 		break
 	}
 }
 
-// SaveList saves a task list to disk.
+// HandleRecurrence creates the next occurrence of a recurring task after completion.
+// Returns the name of the list the new task was added to, or "" if no recurrence was needed.
+// When the task has a Source, the new occurrence is added to the source list (and saved).
+// Otherwise it is added to currentList (caller is responsible for saving).
+func (s *Storage) HandleRecurrence(toggled *task.Task, currentList *task.TaskList) string {
+	if toggled == nil || !toggled.Completed || toggled.RecurDays <= 0 {
+		return ""
+	}
+
+	nextTask := toggled.CreateNextRecurrence()
+	if nextTask == nil {
+		return ""
+	}
+
+	if toggled.Source != "" {
+		sourceList, err := s.LoadList(toggled.Source)
+		if err != nil {
+			return ""
+		}
+
+		toggledContent := strings.TrimSpace(toggled.Content)
+		for _, t := range sourceList.Tasks {
+			if strings.TrimSpace(t.Content) == toggledContent && t.Completed {
+				return ""
+			}
+		}
+
+		sourceList.Add(nextTask)
+		if err := s.SaveList(sourceList); err != nil {
+			fmt.Fprintf(os.Stderr, "Error saving list %s: %v\n", sourceList.Name, err)
+		}
+		return toggled.Source
+	}
+
+	currentList.Add(nextTask)
+	return currentList.Name
+}
+
+// SaveList saves a task list to disk using atomic write (temp + fsync + rename)
+// to prevent data loss if the process is interrupted mid-write.
 func (s *Storage) SaveList(list *task.TaskList) error {
 	if err := s.EnsureDir(); err != nil {
 		return err
 	}
 
 	path := s.ListPath(list.Name)
-	file, err := os.Create(path)
+	tmp := path + ".tmp"
+	file, err := os.Create(tmp)
 	if err != nil {
-		return err
+		return fmt.Errorf("creating temp file: %w", err)
 	}
-	defer file.Close()
 
 	for _, t := range list.Tasks {
 		fmt.Fprintln(file, t.String())
 	}
 
-	return nil
+	if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("syncing temp file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+
+	return os.Rename(tmp, path)
 }
 
 // GetAllLists returns names of all available lists
@@ -288,9 +343,13 @@ func (s *Storage) ListExists(name string) bool {
 
 // ShouldResetToday checks if today's list should be reset
 func (s *Storage) ShouldResetToday() bool {
+	if s.resetDoneToday {
+		return false
+	}
+
 	data, err := os.ReadFile(s.LastResetFile)
 	if err != nil {
-		return true // If file doesn't exist, reset is needed
+		return true
 	}
 
 	lastReset := strings.TrimSpace(string(data))
@@ -302,14 +361,22 @@ func (s *Storage) ShouldResetToday() bool {
 // MarkTodayReset marks that today's list has been reset
 func (s *Storage) MarkTodayReset() error {
 	today := time.Now().Format("2006-01-02")
-	return os.WriteFile(s.LastResetFile, []byte(today), 0644)
+	if err := os.WriteFile(s.LastResetFile, []byte(today), 0644); err != nil {
+		return err
+	}
+	s.resetDoneToday = true
+	return nil
 }
 
 // ShouldSyncToday checks if lists should sync to gist today
 func (s *Storage) ShouldSyncToday() bool {
+	if s.syncDoneToday {
+		return false
+	}
+
 	data, err := os.ReadFile(s.LastSyncFile)
 	if err != nil {
-		return true // If file doesn't exist, sync is needed
+		return true
 	}
 
 	lastSync := strings.TrimSpace(string(data))
@@ -321,7 +388,11 @@ func (s *Storage) ShouldSyncToday() bool {
 // MarkSyncDone marks that sync has been done today
 func (s *Storage) MarkSyncDone() error {
 	today := time.Now().Format("2006-01-02")
-	return os.WriteFile(s.LastSyncFile, []byte(today), 0644)
+	if err := os.WriteFile(s.LastSyncFile, []byte(today), 0644); err != nil {
+		return err
+	}
+	s.syncDoneToday = true
+	return nil
 }
 
 // ResetTodayList clears today's list and populates with due tasks
