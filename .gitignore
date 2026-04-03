@@ -1,7 +1,11 @@
-# Binary
+# Binaries
+tasks
 tasks-go
+tasks-debug
+*.test
 
-# IDE
+# AI/IDE tooling
+.serena/
 .idea/
 .vscode/
 *.swp
@@ -9,5 +13,13 @@ tasks-go
 
 # OS
 .DS_Store
+
+# Go
+vendor/
+
+# Logs
+*.log
+
+# Agent config
 AGENTS.md
 CLAUDE.md
