@@ -17,6 +17,7 @@ type Storage struct {
 	CurrentListFile string
 	LastResetFile   string
 	LastSyncFile    string
+	LocalStateFile  string
 	resetDoneToday  bool
 	syncDoneToday   bool
 }
@@ -28,6 +29,7 @@ func DefaultStorage() *Storage {
 		CurrentListFile: filepath.Join(home, ".current-tasks-list"),
 		LastResetFile:   filepath.Join(home, ".tasks-today-last-reset"),
 		LastSyncFile:    filepath.Join(home, ".tasks-last-sync"),
+		LocalStateFile:  filepath.Join(home, ".tasks-local-state.json"),
 	}
 }
 
@@ -500,4 +502,28 @@ func (s *Storage) GetAllListInfo() ([]*ListInfo, error) {
 	}
 
 	return infos, nil
+}
+
+// SaveTaskTracked saves tracked time to a task identified by list name and content.
+// If source is non-empty, the tracked time is saved to the source list instead
+// (for today-list references that should persist across daily resets).
+func (s *Storage) SaveTaskTracked(listName, content, source string, tracked time.Duration) error {
+	saveList := listName
+	if source != "" {
+		saveList = source
+	}
+
+	list, err := s.loadListRaw(saveList)
+	if err != nil {
+		return err
+	}
+
+	for _, t := range list.Tasks {
+		if strings.TrimSpace(t.Content) == content {
+			t.Tracked = &tracked
+			break
+		}
+	}
+
+	return s.SaveList(list)
 }

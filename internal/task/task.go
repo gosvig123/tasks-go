@@ -17,6 +17,7 @@ type Task struct {
 	CreatedAt   *time.Time
 	Source      string         // For today's list: which list this task came from
 	Estimate    *time.Duration // @est:2h, @est:30m, @est:1h30m
+	Tracked     *time.Duration // @tracked:1h30m45s — accumulated time tracking
 	StartTime   *TimeOfDay     // @at:09:00, @at:14:30
 	Subtasks    []*Task        // child tasks (single level only)
 	Parent      *Task          // back-pointer to parent (nil for top-level, not serialized)
@@ -42,6 +43,7 @@ var (
 	sourceRegex  = regexp.MustCompile(`@source:([a-zA-Z0-9_-]+)`)
 	descRegex    = regexp.MustCompile(`@desc:"([^"]*)"`)
 	estRegex     = regexp.MustCompile(`@est:(\d+h)?(\d+m)?`)
+	trackedRegex = regexp.MustCompile(`@tracked:(\d+h)?(\d+m)?(\d+s)?`)
 	startRegex   = regexp.MustCompile(`@at:(\d{1,2}:\d{2})`)
 	createdRegex = regexp.MustCompile(`\|\| (\d{4}-\d{2}-\d{2})$`)
 )
@@ -135,6 +137,31 @@ func Parse(line string) (*Task, error) {
 		line = estRegex.ReplaceAllString(line, "")
 	}
 
+	// Extract tracked time
+	if match := trackedRegex.FindStringSubmatch(line); match != nil {
+		var totalSeconds int
+		if match[1] != "" {
+			var h int
+			fmt.Sscanf(match[1], "%dh", &h)
+			totalSeconds += h * 3600
+		}
+		if match[2] != "" {
+			var m int
+			fmt.Sscanf(match[2], "%dm", &m)
+			totalSeconds += m * 60
+		}
+		if match[3] != "" {
+			var s int
+			fmt.Sscanf(match[3], "%ds", &s)
+			totalSeconds += s
+		}
+		if totalSeconds > 0 {
+			d := time.Duration(totalSeconds) * time.Second
+			task.Tracked = &d
+		}
+		line = trackedRegex.ReplaceAllString(line, "")
+	}
+
 	// Extract start time
 	if match := startRegex.FindStringSubmatch(line); len(match) > 1 {
 		var h, m int
@@ -225,6 +252,23 @@ func (t *Task) String() string {
 		}
 		if minutes > 0 {
 			sb.WriteString(fmt.Sprintf("%dm", minutes))
+		}
+	}
+
+	if t.Tracked != nil {
+		totalSeconds := int(t.Tracked.Seconds())
+		hours := totalSeconds / 3600
+		minutes := (totalSeconds % 3600) / 60
+		seconds := totalSeconds % 60
+		sb.WriteString(" @tracked:")
+		if hours > 0 {
+			sb.WriteString(fmt.Sprintf("%dh", hours))
+		}
+		if minutes > 0 {
+			sb.WriteString(fmt.Sprintf("%dm", minutes))
+		}
+		if seconds > 0 || (hours == 0 && minutes == 0) {
+			sb.WriteString(fmt.Sprintf("%ds", seconds))
 		}
 	}
 

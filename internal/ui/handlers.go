@@ -3,9 +3,11 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/krisitan/tasks-go/internal/storage"
 )
 
 func (m *TaskViewModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -119,6 +121,123 @@ func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		if (m.viewMode == ViewSingleList || m.viewMode == ViewAllPending) && len(m.items) > 0 {
 			return m, m.startEditTask()
+		}
+
+	case "T":
+		if m.selectedTaskContent == "" {
+			return m, nil
+		}
+		sel, _ := m.storage.GetSelectedTask()
+		if sel == nil {
+			return m, nil
+		}
+		if sel.IsRunning() {
+			// Pause: freeze accumulated, clear started_at, checkpoint to task
+			sel.AccumulatedSecs += int(time.Since(*sel.StartedAt).Seconds())
+			sel.StartedAt = nil
+			m.timerRunning = false
+			m.selectedTaskState = sel
+			m.storage.SetSelectedTask(sel)
+			if sel.AccumulatedSecs > 0 {
+				tracked := time.Duration(sel.AccumulatedSecs) * time.Second
+				m.storage.SaveTaskTracked(sel.List, sel.Content, sel.Source, tracked)
+			}
+			m.statusMsg = "Timer paused"
+		} else {
+			// Start: set started_at to now
+			now := time.Now()
+			sel.StartedAt = &now
+			m.timerRunning = true
+			m.selectedTaskState = sel
+			m.storage.SetSelectedTask(sel)
+			m.statusMsg = "Timer started"
+			m.tickGen++
+			gen := m.tickGen
+			return m, tea.Tick(time.Second, func(t time.Time) tea.Msg { return timerTickMsg{gen: gen} })
+		}
+
+	case "S":
+		if len(m.items) > 0 {
+			item := m.items[m.cursor]
+			if item.IsSubtask {
+				return m, nil
+			}
+			content := strings.TrimSpace(item.Task.Content)
+			listName := item.ListName
+			if listName == "" {
+				listName = m.listName
+			}
+			// Toggle: if already selected, deselect
+			if m.selectedTaskContent == content && m.selectedTaskList == listName {
+				// Save tracked time to task before clearing
+				sel, _ := m.storage.GetSelectedTask()
+				if sel != nil {
+					totalSecs := sel.AccumulatedSecs
+					if sel.IsRunning() {
+						totalSecs += int(time.Since(*sel.StartedAt).Seconds())
+					}
+					if totalSecs > 0 {
+						tracked := time.Duration(totalSecs) * time.Second
+						m.storage.SaveTaskTracked(sel.List, sel.Content, sel.Source, tracked)
+						item.Task.Tracked = &tracked
+					}
+				}
+				m.timerRunning = false
+				m.selectedTaskContent = ""
+				m.selectedTaskList = ""
+				m.selectedTaskState = nil
+				m.storage.ClearSelectedTask()
+				m.statusMsg = "Task deselected"
+			} else {
+				// Save tracked time on old task if switching selection
+				if m.selectedTaskContent != "" {
+					sel, _ := m.storage.GetSelectedTask()
+					if sel != nil {
+						totalSecs := sel.AccumulatedSecs
+						if sel.IsRunning() {
+							totalSecs += int(time.Since(*sel.StartedAt).Seconds())
+						}
+						if totalSecs > 0 {
+							tracked := time.Duration(totalSecs) * time.Second
+							m.storage.SaveTaskTracked(sel.List, sel.Content, sel.Source, tracked)
+							// Update in-memory tracked time for old task
+							for i := range m.items {
+								oldList := m.items[i].ListName
+								if oldList == "" {
+									oldList = m.listName
+								}
+								if strings.TrimSpace(m.items[i].Task.Content) == sel.Content && oldList == sel.List {
+									m.items[i].Task.Tracked = &tracked
+									break
+								}
+							}
+						}
+					}
+					m.timerRunning = false
+				}
+				// Select new task, loading any existing tracked time
+				m.selectedTaskContent = content
+				m.selectedTaskList = listName
+				now := time.Now()
+				var accSecs int
+				if item.Task.Tracked != nil {
+					accSecs = int(item.Task.Tracked.Seconds())
+				}
+				newSel := &storage.SelectedTask{
+					List:            listName,
+					Content:         content,
+					Source:          item.Task.Source,
+					StartedAt:       &now,
+					AccumulatedSecs: accSecs,
+				}
+				m.storage.SetSelectedTask(newSel)
+				m.selectedTaskState = newSel
+				m.timerRunning = true
+				m.statusMsg = "Task selected"
+				m.tickGen++
+				gen := m.tickGen
+				return m, tea.Tick(time.Second, func(t time.Time) tea.Msg { return timerTickMsg{gen: gen} })
+			}
 		}
 
 	case "s":

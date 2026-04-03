@@ -248,6 +248,18 @@ func (m *TaskViewModel) View() string {
 		}
 	}
 
+	// Selected task timer (uses cached state to avoid disk I/O in render)
+	if m.selectedTaskContent != "" && m.selectedTaskState != nil {
+		elapsed := formatElapsed(m.selectedTaskState.Elapsed())
+		timerState := "paused"
+		if m.selectedTaskState.IsRunning() {
+			timerState = "running"
+		}
+		timerLine := fmt.Sprintf("\u25b8 %s \u2014 %s (%s)", m.selectedTaskContent, elapsed, timerState)
+		sb.WriteString("\n")
+		sb.WriteString(selectedStyle.Render(timerLine))
+	}
+
 	// Status message
 	if m.statusMsg != "" {
 		sb.WriteString("\n")
@@ -288,6 +300,9 @@ func (m *TaskViewModel) renderTimelineSplitView() string {
 	overhead := 5
 	if m.inputMode == InputSearch {
 		overhead += 2
+	}
+	if m.selectedTaskContent != "" {
+		overhead += 1
 	}
 	if m.statusMsg != "" {
 		overhead += 1
@@ -345,6 +360,18 @@ func (m *TaskViewModel) renderTimelineSplitView() string {
 
 	// Panels side by side
 	sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel))
+
+	// Selected task timer (uses cached state to avoid disk I/O in render)
+	if m.selectedTaskContent != "" && m.selectedTaskState != nil {
+		elapsed := formatElapsed(m.selectedTaskState.Elapsed())
+		timerState := "paused"
+		if m.selectedTaskState.IsRunning() {
+			timerState = "running"
+		}
+		timerLine := fmt.Sprintf("\u25b8 %s \u2014 %s (%s)", m.selectedTaskContent, elapsed, timerState)
+		sb.WriteString("\n")
+		sb.WriteString(selectedStyle.Render(timerLine))
+	}
 
 	// Status message
 	if m.statusMsg != "" {
@@ -680,6 +707,15 @@ func (m *TaskViewModel) renderTaskLine(idx int, item TaskItem, contentWidth int,
 		cursor = "> "
 	}
 
+	selected := " "
+	itemList := item.ListName
+	if itemList == "" {
+		itemList = m.listName
+	}
+	if m.selectedTaskContent == strings.TrimSpace(item.Task.Content) && m.selectedTaskList == itemList {
+		selected = "▸"
+	}
+
 	indent := ""
 	if item.IsSubtask {
 		indent = "    "
@@ -726,7 +762,7 @@ func (m *TaskViewModel) renderTaskLine(idx int, item TaskItem, contentWidth int,
 			content = string(contentRunes[:maxContent-1]) + "…"
 		}
 		listNameWidth := listColWidth - 2
-		return fmt.Sprintf("%s%s%-*s %s %-*s  %s", indent, cursor, listNameWidth, item.ListName, check, maxContent, content, due)
+		return fmt.Sprintf("%s%s%s%-*s %s %-*s  %s", indent, cursor, selected, listNameWidth, item.ListName, check, maxContent, content, due)
 	}
 
 	// Single list view
@@ -738,7 +774,7 @@ func (m *TaskViewModel) renderTaskLine(idx int, item TaskItem, contentWidth int,
 	if len(contentRunes) > maxContent && maxContent > 1 {
 		content = string(contentRunes[:maxContent-1]) + "…"
 	}
-	return fmt.Sprintf("%s%s%s %-*s  %s", indent, cursor, check, maxContent, content, due)
+	return fmt.Sprintf("%s%s%s%s %-*s  %s", indent, cursor, selected, check, maxContent, content, due)
 }
 
 func (m *TaskViewModel) renderDescriptionLine(item TaskItem, contentWidth int, listColWidth int) string {
@@ -782,4 +818,19 @@ func (m *TaskViewModel) getHelp() string {
 		return "↑/↓: navigate • Space/Tab: select • a: all • n: none • Enter: add • /: search • q: quit"
 	}
 	return ""
+}
+
+// formatElapsed formats a duration for display.
+func formatElapsed(d time.Duration) string {
+	totalSecs := int(d.Seconds())
+	if totalSecs < 0 {
+		totalSecs = 0
+	}
+	h := totalSecs / 3600
+	m := (totalSecs % 3600) / 60
+	s := totalSecs % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh %02dm", h, m)
+	}
+	return fmt.Sprintf("%dm %02ds", m, s)
 }

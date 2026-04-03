@@ -72,6 +72,10 @@ type timelineRefreshMsg struct {
 // state without resetting the list cursor. Used after in-place task edits.
 type refreshDisplayMsg struct{}
 
+// timerTickMsg is sent every second while the timer is running.
+// gen prevents duplicate tick chains: only the latest generation is honoured.
+type timerTickMsg struct{ gen int }
+
 type listSwitcherLoadedMsg struct {
 	lists     []string
 	infoCache map[string]*storage.ListInfo

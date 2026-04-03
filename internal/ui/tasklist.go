@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -50,6 +51,13 @@ type TaskViewModel struct {
 	focusedField int             // 0=title, 1=desc, 2=due, 3=recur, 4=est, 5=start
 	searchInput  textinput.Model
 	searchQuery  string
+
+	// Selected task (persisted locally)
+	selectedTaskList    string
+	selectedTaskContent string
+	timerRunning        bool
+	selectedTaskState   *storage.SelectedTask // cached for render (avoids disk I/O in View)
+	tickGen             int                   // generation counter for timer tick chains
 
 	// List switcher
 	lists      []string
@@ -372,8 +380,32 @@ func (m *TaskViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.showTimeline = msg.showTimeline
 		m.cursor = 0
 		m.searchQuery = ""
+		sel, _ := m.storage.GetSelectedTask()
+		if sel != nil {
+			m.selectedTaskList = sel.List
+			m.selectedTaskContent = sel.Content
+			m.timerRunning = sel.IsRunning()
+			m.selectedTaskState = sel
+		} else {
+			m.selectedTaskList = ""
+			m.selectedTaskContent = ""
+			m.timerRunning = false
+			m.selectedTaskState = nil
+		}
 		if m.showTimeline {
 			m.timelineLayout = computeTimelineLayout(m.items, 8, 18)
+		}
+		if m.timerRunning {
+			m.tickGen++
+			gen := m.tickGen
+			return m, tea.Tick(time.Second, func(t time.Time) tea.Msg { return timerTickMsg{gen: gen} })
+		}
+		return m, nil
+
+	case timerTickMsg:
+		if m.timerRunning && msg.gen == m.tickGen {
+			gen := m.tickGen
+			return m, tea.Tick(time.Second, func(t time.Time) tea.Msg { return timerTickMsg{gen: gen} })
 		}
 		return m, nil
 
