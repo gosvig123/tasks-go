@@ -41,7 +41,7 @@ var (
 	dueRegex     = regexp.MustCompile(`@due:(\d{4}-\d{2}-\d{2})`)
 	doneRegex    = regexp.MustCompile(`@done:(\d{4}-\d{2}-\d{2})`)
 	recurRegex   = regexp.MustCompile(`@recur:(\d+)`)
-	sourceRegex  = regexp.MustCompile(`@source:([a-zA-Z0-9_-]+)`)
+	sourceRegex  = regexp.MustCompile(`@source:(?:"([^"]+)"|([a-zA-Z0-9_-]+))`)
 	descRegex    = regexp.MustCompile(`@desc:"([^"]*)"`)
 	estRegex     = regexp.MustCompile(`@est:(\d+h)?(\d+m)?`)
 	trackedRegex = regexp.MustCompile(`@tracked:(\d+h)?(\d+m)?(\d+s)?`)
@@ -106,9 +106,13 @@ func Parse(line string) (*Task, error) {
 		line = recurRegex.ReplaceAllString(line, "")
 	}
 
-	// Extract source
+	// Extract source (group 1 = quoted, group 2 = unquoted)
 	if match := sourceRegex.FindStringSubmatch(line); len(match) > 1 {
-		task.Source = match[1]
+		if match[1] != "" {
+			task.Source = match[1]
+		} else {
+			task.Source = match[2]
+		}
 		line = sourceRegex.ReplaceAllString(line, "")
 	}
 
@@ -241,8 +245,12 @@ func (t *Task) String() string {
 	}
 
 	if t.Source != "" {
-		sb.WriteString(" @source:")
-		sb.WriteString(t.Source)
+		if strings.ContainsAny(t.Source, " \t") {
+			sb.WriteString(fmt.Sprintf(` @source:"%s"`, t.Source))
+		} else {
+			sb.WriteString(" @source:")
+			sb.WriteString(t.Source)
+		}
 	}
 
 	if t.Estimate != nil {

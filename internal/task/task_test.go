@@ -380,3 +380,27 @@ func TestSubtaskReferenceRoundTrip(t *testing.T) {
 		t.Error("expected completed status to survive stub round-trip")
 	}
 }
+
+func TestSourceWithSpacesRoundTrip(t *testing.T) {
+	task := &Task{
+		Content: "Map out materials",
+		Source:  "sunglass project",
+	}
+
+	result := task.String()
+	if !strings.Contains(result, `@source:"sunglass project"`) {
+		t.Errorf("expected quoted source in output, got: %s", result)
+	}
+
+	lines := strings.Split(result, "\n")
+	parsed := ParseLines(lines)
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(parsed))
+	}
+	if parsed[0].Source != "sunglass project" {
+		t.Errorf("expected source 'sunglass project', got '%s'", parsed[0].Source)
+	}
+	if parsed[0].Content != "Map out materials" {
+		t.Errorf("expected content 'Map out materials', got '%s'", parsed[0].Content)
+	}
+}
