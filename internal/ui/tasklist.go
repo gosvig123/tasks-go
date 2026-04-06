@@ -86,6 +86,7 @@ type TaskViewModel struct {
 
 	// Timeline state
 	showTimeline   bool            // whether timeline panel is visible
+	showUpcoming   bool            // show upcoming tasks section in today view
 	timelineFocus  bool            // whether the right panel (timeline) has focus
 	timelineCursor int             // cursor index within timeline-ordered tasks
 	timelineLayout *TimelineLayout // computed timeline layout
@@ -242,6 +243,23 @@ func (m *TaskViewModel) loadSingleList() tea.Msg {
 	items := make([]TaskItem, 0, len(uncompleted)+len(completed))
 	items = append(items, uncompleted...)
 	items = append(items, completed...)
+
+	// Load upcoming tasks if toggle is on and we're on today list
+	debugLog.Printf("loadSingleList: showUpcoming=%v isToday=%v", m.showUpcoming, isToday)
+	if m.showUpcoming && isToday {
+		upcomingTasks, err := m.storage.LoadUpcomingTasks(14)
+		if err == nil && len(upcomingTasks) > 0 {
+			for _, ut := range upcomingTasks {
+				items = append(items, TaskItem{
+					Task:       ut.Task,
+					ListName:   ut.ListName,
+					Index:      -1,
+					SubIndex:   -1,
+					IsUpcoming: true,
+				})
+			}
+		}
+	}
 
 	return tasksLoadedMsg{
 		items:        items,

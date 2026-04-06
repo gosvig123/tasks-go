@@ -2,6 +2,7 @@ package task
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -118,7 +119,7 @@ func Parse(line string) (*Task, error) {
 	}
 
 	// Extract estimate
-	if match := estRegex.FindStringSubmatch(line); match != nil {
+	if match := estRegex.FindStringSubmatch(line); match != nil && (match[1] != "" || match[2] != "") {
 		var totalMinutes int
 		if match[1] != "" {
 			var h int
@@ -138,7 +139,7 @@ func Parse(line string) (*Task, error) {
 	}
 
 	// Extract tracked time
-	if match := trackedRegex.FindStringSubmatch(line); match != nil {
+	if match := trackedRegex.FindStringSubmatch(line); match != nil && (match[1] != "" || match[2] != "" || match[3] != "") {
 		var totalSeconds int
 		if match[1] != "" {
 			var h int
@@ -193,6 +194,7 @@ func ParseLines(lines []string) []*Task {
 		if isIndented && currentParent != nil {
 			parsed, err := Parse(strings.TrimPrefix(line, "  "))
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: skipping malformed task line: %q\n", strings.TrimSpace(line))
 				continue
 			}
 			parsed.Parent = currentParent
@@ -201,6 +203,7 @@ func ParseLines(lines []string) []*Task {
 			trimmed := strings.TrimSpace(line)
 			parsed, err := Parse(trimmed)
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: skipping malformed task line: %q\n", trimmed)
 				continue
 			}
 			tasks = append(tasks, parsed)
@@ -342,31 +345,27 @@ func NewReferenceStub(t *Task, source string) *Task {
 }
 
 // ResolveFrom merges metadata from a source task into this reference.
-// Source is the single truth: completion status and all metadata are
-// copied unconditionally. Nil/zero source values for optional metadata
-// do not overwrite existing stub values (preserving locally-set fields
-// like @est or @at assigned directly on the today task).
+// Source is the single truth for scheduling/identity fields (DueDate, RecurDays,
+// Description, CreatedAt, completion). These are always overwritten, even when
+// the source value is nil/zero, so removals propagate to today stubs.
+// Estimate and StartTime are only overwritten when source has a value — they
+// may be set locally on the today task for per-day overrides.
 func (t *Task) ResolveFrom(source *Task) {
 	t.Completed = source.Completed
 	t.CompletedAt = source.CompletedAt
 
-	if source.DueDate != nil {
-		t.DueDate = source.DueDate
-	}
-	if source.RecurDays > 0 {
-		t.RecurDays = source.RecurDays
-	}
+	// Always sync from source (source is truth; removals must propagate)
+	t.DueDate = source.DueDate
+	t.RecurDays = source.RecurDays
+	t.Description = source.Description
+	t.CreatedAt = source.CreatedAt
+
+	// Additive: only overwrite when source has a value (may be set locally on today)
 	if source.Estimate != nil {
 		t.Estimate = source.Estimate
 	}
 	if source.StartTime != nil {
 		t.StartTime = source.StartTime
-	}
-	if source.Description != "" {
-		t.Description = source.Description
-	}
-	if source.CreatedAt != nil {
-		t.CreatedAt = source.CreatedAt
 	}
 
 	// Resolve subtask metadata + completion by matching content
@@ -421,6 +420,21 @@ func (t *Task) IsDueToday() bool {
 	return !dueLocal.After(today)
 }
 
+// IsDueWithin returns true if the task is due after today and within the given number of days
+func (t *Task) IsDueWithin(days int) bool {
+	if t.DueDate == nil || t.Completed {
+		return false
+	}
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	dueLocal := time.Date(t.DueDate.Year(), t.DueDate.Month(), t.DueDate.Day(), 0, 0, 0, 0, now.Location())
+	if !dueLocal.After(today) {
+		return false
+	}
+	cutoff := today.AddDate(0, 0, days)
+	return !dueLocal.After(cutoff)
+}
+
 // CreateNextRecurrence creates the next occurrence of a recurring task
 func (t *Task) CreateNextRecurrence() *Task {
 	if t.RecurDays <= 0 {
@@ -439,5 +453,6 @@ func (t *Task) CreateNextRecurrence() *Task {
 		CreatedAt:   &now,
 		Source:      "", // New occurrence goes to original list, not today
 		Estimate:    t.Estimate,
+		StartTime:   t.StartTime,
 	}
 }

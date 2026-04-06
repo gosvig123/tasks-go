@@ -35,7 +35,8 @@ type TaskItem struct {
 	ListName  string
 	Index     int  // original index in list (parent index for subtasks)
 	SubIndex  int  // -1 for top-level, 0+ for subtask position
-	IsSubtask bool // controls indented rendering
+	IsSubtask  bool // controls indented rendering
+	IsUpcoming bool // true for tasks in the upcoming section
 }
 
 // RunTaskListResult indicates the result of running the task list

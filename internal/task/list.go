@@ -176,6 +176,23 @@ func (l *TaskList) GetDueTasks() []*Task {
 	return due
 }
 
+// GetUpcomingTasks returns incomplete tasks due after today and within the given number of days, sorted by due date
+func (l *TaskList) GetUpcomingTasks(days int) []*Task {
+	var upcoming []*Task
+	for _, t := range l.Tasks {
+		if t.IsDueWithin(days) {
+			upcoming = append(upcoming, t)
+		}
+		for _, sub := range t.Subtasks {
+			if sub.IsDueWithin(days) {
+				upcoming = append(upcoming, sub)
+			}
+		}
+	}
+	sortByDueDate(upcoming)
+	return upcoming
+}
+
 // sortByDueDate sorts tasks by due date (earliest first, nil dates last)
 func sortByDueDate(tasks []*Task) {
 	sort.Slice(tasks, func(i, j int) bool {

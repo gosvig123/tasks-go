@@ -17,6 +17,42 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 
 		item := m.items[m.cursor]
 
+		// Handle upcoming items — save to source list
+		if item.IsUpcoming {
+			dueOffset, specificDate := parseDueValue(dueValue)
+			recurDays := parseRecurValue(recurValue)
+			estimate := parseEstimateValue(estValue)
+			startTime := parseStartTimeValue(startValue)
+			list, err := m.storage.LoadList(item.ListName)
+			if err != nil {
+				return nil
+			}
+			originalContent := strings.TrimSpace(item.Task.Content)
+			for _, t := range list.Tasks {
+				if strings.TrimSpace(t.Content) == originalContent {
+					t.Content = content
+					t.Description = description
+					t.RecurDays = recurDays
+					t.Estimate = estimate
+					t.StartTime = startTime
+					if specificDate != nil {
+						t.DueDate = specificDate
+					} else if dueOffset > 0 {
+						due := time.Now().AddDate(0, 0, dueOffset)
+						t.DueDate = &due
+					} else if dueValue == "" {
+						t.DueDate = nil
+					}
+					break
+				}
+			}
+			if err := m.storage.SaveList(list); err != nil {
+				debugLog.Printf("Error saving list %s: %v", list.Name, err)
+			}
+			m.inputMode = InputNormal
+			return m.loadTasks()()
+		}
+
 		// Parse form values
 		dueOffset, specificDate := parseDueValue(dueValue)
 		recurDays := parseRecurValue(recurValue)
@@ -212,6 +248,22 @@ func (m *TaskViewModel) toggleTask(idx int) tea.Cmd {
 
 		item := m.items[idx]
 
+		// Handle upcoming items — operate directly on source list
+		if item.IsUpcoming {
+			list, err := m.storage.LoadList(item.ListName)
+			if err != nil {
+				return nil
+			}
+			for i, t := range list.Tasks {
+				if t.Content == item.Task.Content {
+					list.Toggle(i)
+					break
+				}
+			}
+			m.storage.SaveList(list)
+			return m.loadTasks()()
+		}
+
 		if m.viewMode == ViewSingleList && m.taskList != nil {
 			if item.IsSubtask {
 				// Toggle subtask
@@ -341,6 +393,22 @@ func (m *TaskViewModel) deleteTask(idx int) tea.Cmd {
 		}
 
 		item := m.items[idx]
+
+		// Handle upcoming items — delete from source list
+		if item.IsUpcoming {
+			list, err := m.storage.LoadList(item.ListName)
+			if err != nil {
+				return nil
+			}
+			for i, t := range list.Tasks {
+				if t.Content == item.Task.Content {
+					list.Delete(i)
+					break
+				}
+			}
+			m.storage.SaveList(list)
+			return m.loadTasks()()
+		}
 
 		if m.viewMode == ViewSingleList && m.taskList != nil {
 			if item.IsSubtask {

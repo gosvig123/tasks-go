@@ -187,6 +187,7 @@ func (m *TaskViewModel) View() string {
 		sb.WriteString("\n")
 	} else {
 		showedCompletedSeparator := false
+		showedUpcomingSeparator := false
 		completedShown := 0
 		maxCompletedToShow := 5 // Only show a few completed tasks
 
@@ -199,6 +200,14 @@ func (m *TaskViewModel) View() string {
 		}
 
 		for i, item := range m.items {
+			// Show upcoming section separator
+			if item.IsUpcoming && !showedUpcomingSeparator {
+				showedUpcomingSeparator = true
+				sb.WriteString("\n")
+				sb.WriteString(separatorStyle.Render("  ── upcoming ──"))
+				sb.WriteString("\n\n")
+			}
+
 			// Show separator before first completed task
 			if item.Task.Completed && !showedCompletedSeparator && m.viewMode != ViewPicker {
 				showedCompletedSeparator = true
@@ -441,6 +450,7 @@ func (m *TaskViewModel) renderTaskListPanel(panelWidth int) string {
 		sb.WriteString("\n")
 	} else {
 		showedCompletedSeparator := false
+		showedUpcomingSeparator := false
 		completedShown := 0
 		maxCompletedToShow := 3
 
@@ -452,6 +462,14 @@ func (m *TaskViewModel) renderTaskListPanel(panelWidth int) string {
 		}
 
 		for i, item := range m.items {
+			// Show upcoming section separator
+			if item.IsUpcoming && !showedUpcomingSeparator {
+				showedUpcomingSeparator = true
+				sb.WriteString("\n")
+				sb.WriteString(separatorStyle.Render("  ── upcoming ──"))
+				sb.WriteString("\n\n")
+			}
+
 			if item.Task.Completed && !showedCompletedSeparator && m.viewMode != ViewPicker {
 				showedCompletedSeparator = true
 				sb.WriteString("\n")
@@ -805,7 +823,7 @@ func (m *TaskViewModel) getHelp() string {
 		if m.inputMode == InputSearch {
 			return "Type to search • ↑/↓: navigate • Enter: keep filter • Esc: clear"
 		}
-		return "↑/↓: navigate • Enter: view • Tab: toggle • a: add • A: +today • e: edit • d: delete • L: lists • q: quit"
+		return "↑/↓: navigate • Enter: view • Tab: toggle • a: add • A: +today • e: edit • d: delete • u: upcoming • L: lists • q: quit"
 	case ViewAllPending:
 		if m.inputMode == InputSearch {
 			return "Type to search • ↑/↓: navigate • Enter: keep filter • Esc: clear"

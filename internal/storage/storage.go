@@ -23,7 +23,11 @@ type Storage struct {
 }
 
 func DefaultStorage() *Storage {
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: could not determine home directory: %v\n", err)
+		os.Exit(1)
+	}
 	return &Storage{
 		TasksDir:        filepath.Join(home, "tasks-lists"),
 		CurrentListFile: filepath.Join(home, ".current-tasks-list"),
@@ -318,13 +322,33 @@ func (s *Storage) CreateList(name string) error {
 	return file.Close()
 }
 
-// DeleteList deletes a list file
+// DeleteList deletes a list file and removes any @source: references
+// to it from today's list to prevent orphaned stubs.
 func (s *Storage) DeleteList(name string) error {
 	path := s.ListPath(name)
-	return os.Remove(path)
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	// Remove references to the deleted list from today's list
+	todayList, err := s.loadListRaw("today")
+	if err != nil {
+		return nil // today list missing or unreadable — not an error
+	}
+	var kept []*task.Task
+	for _, t := range todayList.Tasks {
+		if t.Source != name {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) != len(todayList.Tasks) {
+		todayList.Tasks = kept
+		_ = s.SaveList(todayList)
+	}
+	return nil
 }
 
-// RenameList renames a list
+// RenameList renames a list and updates any @source: references to it
+// in today's list so existing stubs continue to resolve correctly.
 func (s *Storage) RenameList(oldName, newName string) error {
 	oldPath := s.ListPath(oldName)
 	newPath := s.ListPath(newName)
@@ -333,7 +357,26 @@ func (s *Storage) RenameList(oldName, newName string) error {
 		return fmt.Errorf("list '%s' already exists", newName)
 	}
 
-	return os.Rename(oldPath, newPath)
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return err
+	}
+
+	// Update @source: references in today's list
+	todayList, err := s.loadListRaw("today")
+	if err != nil {
+		return nil // today list missing or unreadable — not an error
+	}
+	changed := false
+	for _, t := range todayList.Tasks {
+		if t.Source == oldName {
+			t.Source = newName
+			changed = true
+		}
+	}
+	if changed {
+		_ = s.SaveList(todayList)
+	}
+	return nil
 }
 
 // ListExists checks if a list exists
@@ -397,14 +440,23 @@ func (s *Storage) MarkSyncDone() error {
 	return nil
 }
 
-// ResetTodayList clears today's list and populates with due tasks
+// ResetTodayList resets today's list: reference stubs are replaced with
+// freshly-computed due tasks, but manually-added tasks (no @source:) that
+// are still pending are carried over so they are not lost on daily reset.
 func (s *Storage) ResetTodayList() (int, error) {
 	if !s.ShouldResetToday() {
 		return 0, nil
 	}
 
-	// Clear today's list
+	// Preserve pending manually-added tasks from the previous day
 	todayList := task.NewTaskList("today")
+	if existing, err := s.loadListRaw("today"); err == nil {
+		for _, t := range existing.Tasks {
+			if !t.IsReference() && !t.Completed {
+				todayList.Add(t)
+			}
+		}
+	}
 
 	// Get all lists and find due tasks
 	lists, err := s.GetAllLists()
@@ -526,4 +578,53 @@ func (s *Storage) SaveTaskTracked(listName, content, source string, tracked time
 	}
 
 	return s.SaveList(list)
+}
+
+// UpcomingTask holds a task and its source list name for display in the upcoming section
+type UpcomingTask struct {
+	Task     *task.Task
+	ListName string
+}
+
+// LoadUpcomingTasks loads all tasks due within the given number of days from all lists (excluding today).
+// Returns tasks sorted by due date, deduplicated against today's list.
+func (s *Storage) LoadUpcomingTasks(days int) ([]UpcomingTask, error) {
+	lists, err := s.GetAllLists()
+	if err != nil {
+		return nil, fmt.Errorf("loading lists: %w", err)
+	}
+
+	// Load today's list to deduplicate (upcoming should not include tasks already in today)
+	todayList, _ := s.loadListRaw("today")
+	todayContents := make(map[string]bool)
+	if todayList != nil {
+		for _, t := range todayList.Tasks {
+			todayContents[t.Content] = true
+		}
+	}
+
+	var upcoming []UpcomingTask
+	for _, listName := range lists {
+		if listName == "today" {
+			continue
+		}
+		list, err := s.loadListRaw(listName)
+		if err != nil {
+			continue // skip lists that fail to load
+		}
+		for _, t := range list.GetUpcomingTasks(days) {
+			// Skip if already in today's list (by content match)
+			if todayContents[t.Content] {
+				continue
+			}
+			upcoming = append(upcoming, UpcomingTask{Task: t, ListName: listName})
+		}
+	}
+
+	// Sort all upcoming tasks by due date
+	sort.Slice(upcoming, func(i, j int) bool {
+		return upcoming[i].Task.DueDate.Before(*upcoming[j].Task.DueDate)
+	})
+
+	return upcoming, nil
 }

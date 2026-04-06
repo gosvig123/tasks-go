@@ -260,6 +260,13 @@ func (m *TaskViewModel) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case "u":
+		if m.listName == "today" {
+			m.showUpcoming = !m.showUpcoming
+			debugLog.Printf("u pressed: listName=%s showUpcoming=%v", m.listName, m.showUpcoming)
+			return m, m.loadTasks()
+		}
+
 	case "l", "right":
 		if m.showTimeline && !m.timelineFocus {
 			m.timelineFocus = true
