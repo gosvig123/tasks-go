@@ -204,6 +204,12 @@ func (m *TaskViewModel) addSubtaskToParent(content, description, dueValue, recur
 			if err := m.storage.SaveList(m.taskList); err != nil {
 				debugLog.Printf("Error saving list %s: %v", m.taskList.Name, err)
 			}
+			updatedParent := m.taskList.Get(originalIndex)
+			if m.taskList.Name == "today" && updatedParent != nil && updatedParent.Source != "" {
+				m.storage.SyncSubtasksToSource(updatedParent)
+			} else if m.taskList.Name != "today" && updatedParent != nil {
+				m.storage.SyncCompletionToToday(m.taskList.Name, updatedParent)
+			}
 		} else {
 			// All-tasks view
 			list, err := m.storage.LoadList(parentItem.ListName)
@@ -213,6 +219,12 @@ func (m *TaskViewModel) addSubtaskToParent(content, description, dueValue, recur
 			list.AddSubtask(parentItem.Index, subtask)
 			if err := m.storage.SaveList(list); err != nil {
 				debugLog.Printf("Error saving list %s: %v", list.Name, err)
+			}
+			updatedParent := list.Get(parentItem.Index)
+			if list.Name == "today" && updatedParent != nil && updatedParent.Source != "" {
+				m.storage.SyncSubtasksToSource(updatedParent)
+			} else if list.Name != "today" && updatedParent != nil {
+				m.storage.SyncCompletionToToday(list.Name, updatedParent)
 			}
 		}
 

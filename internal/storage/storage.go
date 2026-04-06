@@ -175,10 +175,64 @@ func (s *Storage) SyncCompletionToSource(todayTask *task.Task) {
 	}
 }
 
-// SyncCompletionToToday propagates completion status from a source list task
-// to its matching reference on the today list. This is the reverse of
-// SyncCompletionToSource: when a task is completed on a source list, the
-// today list reference is updated to match.
+// SyncSubtasksToSource propagates subtask additions from a today reference task
+// back to its source task so both views share the same subtask structure.
+func (s *Storage) SyncSubtasksToSource(todayTask *task.Task) {
+	if todayTask.Source == "" {
+		return
+	}
+
+	sourceList, err := s.loadListRaw(todayTask.Source)
+	if err != nil {
+		return
+	}
+
+	todayContent := strings.TrimSpace(todayTask.Content)
+	for _, t := range sourceList.Tasks {
+		if strings.TrimSpace(t.Content) != todayContent {
+			continue
+		}
+
+		existing := make(map[string]*task.Task)
+		for _, srcSub := range t.Subtasks {
+			existing[strings.TrimSpace(srcSub.Content)] = srcSub
+		}
+
+		changed := false
+		for _, todaySub := range todayTask.Subtasks {
+			key := strings.TrimSpace(todaySub.Content)
+			if _, ok := existing[key]; ok {
+				continue
+			}
+
+			newSub := &task.Task{
+				Content:     todaySub.Content,
+				Description: todaySub.Description,
+				Completed:   todaySub.Completed,
+				DueDate:     todaySub.DueDate,
+				CompletedAt: todaySub.CompletedAt,
+				RecurDays:   todaySub.RecurDays,
+				CreatedAt:   todaySub.CreatedAt,
+				Estimate:    todaySub.Estimate,
+				StartTime:   todaySub.StartTime,
+				Parent:      t,
+			}
+			t.Subtasks = append(t.Subtasks, newSub)
+			changed = true
+		}
+
+		if changed {
+			if err := s.SaveList(sourceList); err != nil {
+				fmt.Fprintf(os.Stderr, "Error saving list %s: %v\n", sourceList.Name, err)
+			}
+		}
+		break
+	}
+}
+
+// SyncCompletionToToday propagates task state from a source list task
+// to its matching reference on the today list. Besides completion, it also
+// refreshes subtask structure and metadata via ResolveFrom.
 func (s *Storage) SyncCompletionToToday(sourceListName string, sourceTask *task.Task) {
 	todayList, err := s.loadListRaw("today")
 	if err != nil {
@@ -193,18 +247,7 @@ func (s *Storage) SyncCompletionToToday(sourceListName string, sourceTask *task.
 		if strings.TrimSpace(t.Content) != srcContent {
 			continue
 		}
-		t.Completed = sourceTask.Completed
-		t.CompletedAt = sourceTask.CompletedAt
-		for _, srcSub := range sourceTask.Subtasks {
-			subContent := strings.TrimSpace(srcSub.Content)
-			for _, todaySub := range t.Subtasks {
-				if strings.TrimSpace(todaySub.Content) == subContent {
-					todaySub.Completed = srcSub.Completed
-					todaySub.CompletedAt = srcSub.CompletedAt
-					break
-				}
-			}
-		}
+		t.ResolveFrom(sourceTask)
 		if err := s.SaveList(todayList); err != nil {
 			fmt.Fprintf(os.Stderr, "Error saving list %s: %v\n", todayList.Name, err)
 		}

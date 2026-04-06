@@ -163,6 +163,81 @@ func TestSyncCompletionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSyncSubtasksToSourceAddsNewSubtask(t *testing.T) {
+	store := newTestStorage(t)
+
+	parent := &task.Task{Content: "Project tasks"}
+	sourceList := task.NewTaskList("work")
+	sourceList.Add(parent)
+	if err := store.SaveList(sourceList); err != nil {
+		t.Fatalf("SaveList(work): %v", err)
+	}
+
+	todayList := task.NewTaskList("today")
+	stub := task.NewReferenceStub(parent, "work")
+	todayList.Add(stub)
+	if err := store.SaveList(todayList); err != nil {
+		t.Fatalf("SaveList(today): %v", err)
+	}
+
+	now := time.Now()
+	stub.Subtasks = append(stub.Subtasks, &task.Task{
+		Content:   "Design mockup",
+		CreatedAt: &now,
+		Parent:    stub,
+		Source:    "work",
+	})
+	store.SyncSubtasksToSource(stub)
+
+	reloaded, err := store.LoadList("work")
+	if err != nil {
+		t.Fatalf("LoadList(work): %v", err)
+	}
+	if len(reloaded.Tasks[0].Subtasks) != 1 {
+		t.Fatalf("expected 1 subtask in source, got %d", len(reloaded.Tasks[0].Subtasks))
+	}
+	if reloaded.Tasks[0].Subtasks[0].Content != "Design mockup" {
+		t.Errorf("expected synced subtask content, got %q", reloaded.Tasks[0].Subtasks[0].Content)
+	}
+}
+
+func TestSyncCompletionToTodayAddsMissingSubtask(t *testing.T) {
+	store := newTestStorage(t)
+
+	parent := &task.Task{Content: "Project tasks"}
+	sourceList := task.NewTaskList("work")
+	sourceList.Add(parent)
+	if err := store.SaveList(sourceList); err != nil {
+		t.Fatalf("SaveList(work): %v", err)
+	}
+
+	todayList := task.NewTaskList("today")
+	todayList.Add(task.NewReferenceStub(parent, "work"))
+	if err := store.SaveList(todayList); err != nil {
+		t.Fatalf("SaveList(today): %v", err)
+	}
+
+	sourceList.Tasks[0].Subtasks = append(sourceList.Tasks[0].Subtasks, &task.Task{
+		Content: "Write tests",
+		Parent:  sourceList.Tasks[0],
+	})
+	if err := store.SaveList(sourceList); err != nil {
+		t.Fatalf("SaveList(work) after subtask add: %v", err)
+	}
+	store.SyncCompletionToToday("work", sourceList.Tasks[0])
+
+	reloaded, err := store.LoadList("today")
+	if err != nil {
+		t.Fatalf("LoadList(today): %v", err)
+	}
+	if len(reloaded.Tasks[0].Subtasks) != 1 {
+		t.Fatalf("expected 1 subtask on today stub, got %d", len(reloaded.Tasks[0].Subtasks))
+	}
+	if reloaded.Tasks[0].Subtasks[0].Content != "Write tests" {
+		t.Errorf("expected propagated subtask, got %q", reloaded.Tasks[0].Subtasks[0].Content)
+	}
+}
+
 func TestSyncCompletionToSourceContentMismatch(t *testing.T) {
 	store := newTestStorage(t)
 

@@ -368,35 +368,45 @@ func (t *Task) ResolveFrom(source *Task) {
 		t.StartTime = source.StartTime
 	}
 
-	// Resolve subtask metadata + completion by matching content
+	existing := make(map[string]*Task)
 	for _, sub := range t.Subtasks {
-		subContent := strings.TrimSpace(sub.Content)
-		for _, srcSub := range source.Subtasks {
-			if strings.TrimSpace(srcSub.Content) == subContent {
-				sub.Completed = srcSub.Completed
-				sub.CompletedAt = srcSub.CompletedAt
-				if srcSub.DueDate != nil {
-					sub.DueDate = srcSub.DueDate
-				}
-				if srcSub.RecurDays > 0 {
-					sub.RecurDays = srcSub.RecurDays
-				}
-				if srcSub.Estimate != nil {
-					sub.Estimate = srcSub.Estimate
-				}
-				if srcSub.StartTime != nil {
-					sub.StartTime = srcSub.StartTime
-				}
-				if srcSub.Description != "" {
-					sub.Description = srcSub.Description
-				}
-				if srcSub.CreatedAt != nil {
-					sub.CreatedAt = srcSub.CreatedAt
-				}
-				break
+		existing[strings.TrimSpace(sub.Content)] = sub
+	}
+
+	resolved := make([]*Task, 0, len(source.Subtasks))
+	for _, srcSub := range source.Subtasks {
+		key := strings.TrimSpace(srcSub.Content)
+		sub, ok := existing[key]
+		if !ok {
+			sub = &Task{
+				Content: srcSub.Content,
+				Source:  t.Source,
+				Parent:  t,
+			}
+		} else {
+			sub.Parent = t
+			if sub.Source == "" {
+				sub.Source = t.Source
 			}
 		}
+
+		sub.Completed = srcSub.Completed
+		sub.CompletedAt = srcSub.CompletedAt
+		sub.DueDate = srcSub.DueDate
+		sub.RecurDays = srcSub.RecurDays
+		sub.Description = srcSub.Description
+		sub.CreatedAt = srcSub.CreatedAt
+		if srcSub.Estimate != nil {
+			sub.Estimate = srcSub.Estimate
+		}
+		if srcSub.StartTime != nil {
+			sub.StartTime = srcSub.StartTime
+		}
+
+		resolved = append(resolved, sub)
 	}
+
+	t.Subtasks = resolved
 }
 
 // AllSubtasksCompleted returns true if all subtasks are completed (or there are none).
