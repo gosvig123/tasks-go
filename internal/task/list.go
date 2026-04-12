@@ -130,34 +130,35 @@ func (l *TaskList) Len() int {
 	return len(l.Tasks)
 }
 
-func (l *TaskList) PendingCount() int {
-	count := 0
+func (l *TaskList) counts() (total, completed int) {
 	for _, t := range l.Tasks {
-		if !t.Completed {
-			count++
+		total++
+		if t.Completed {
+			completed++
 		}
 		for _, sub := range t.Subtasks {
-			if !sub.Completed {
-				count++
+			total++
+			if sub.Completed {
+				completed++
 			}
 		}
 	}
-	return count
+	return total, completed
+}
+
+func (l *TaskList) FlattenedCount() int {
+	total, _ := l.counts()
+	return total
+}
+
+func (l *TaskList) PendingCount() int {
+	total, completed := l.counts()
+	return total - completed
 }
 
 func (l *TaskList) CompletedCount() int {
-	count := 0
-	for _, t := range l.Tasks {
-		if t.Completed {
-			count++
-		}
-		for _, sub := range t.Subtasks {
-			if sub.Completed {
-				count++
-			}
-		}
-	}
-	return count
+	_, completed := l.counts()
+	return completed
 }
 
 // Clear removes all tasks

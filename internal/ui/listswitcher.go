@@ -303,8 +303,7 @@ func (m *ListSwitcherModel) View() string {
 			}
 			var line string
 			if info != nil {
-				pending := info.Total - info.Completed
-				line = fmt.Sprintf("%-15s  %d pending", listName, pending)
+				line = fmt.Sprintf("%-15s  %d pending", listName, info.Pending)
 			} else {
 				line = fmt.Sprintf("%-15s", listName)
 			}

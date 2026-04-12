@@ -552,7 +552,7 @@ func (s *Storage) GetListInfo(name string) (*ListInfo, error) {
 
 	return &ListInfo{
 		Name:      name,
-		Total:     list.Len(),
+		Total:     list.FlattenedCount(),
 		Completed: list.CompletedCount(),
 		Pending:   list.PendingCount(),
 	}, nil
