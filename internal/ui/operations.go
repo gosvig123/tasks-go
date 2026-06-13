@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/krisitan/tasks-go/internal/storage"
 	"github.com/krisitan/tasks-go/internal/task"
 )
 
@@ -195,37 +196,8 @@ func (m *TaskViewModel) addSubtaskToParent(content, description, dueValue, recur
 			subtask.DueDate = specificDate
 		}
 
-		if m.viewMode == ViewSingleList && m.taskList != nil {
-			originalIndex := m.taskList.OriginalIndex(parentItem.Task)
-			if originalIndex < 0 {
-				return nil
-			}
-			m.taskList.AddSubtask(originalIndex, subtask)
-			if err := m.storage.SaveList(m.taskList); err != nil {
-				debugLog.Printf("Error saving list %s: %v", m.taskList.Name, err)
-			}
-			updatedParent := m.taskList.Get(originalIndex)
-			if m.taskList.Name == "today" && updatedParent != nil && updatedParent.Source != "" {
-				m.storage.SyncSubtasksToSource(updatedParent)
-			} else if m.taskList.Name != "today" && updatedParent != nil {
-				m.storage.SyncCompletionToToday(m.taskList.Name, updatedParent)
-			}
-		} else {
-			// All-tasks view
-			list, err := m.storage.LoadList(parentItem.ListName)
-			if err != nil {
-				return nil
-			}
-			list.AddSubtask(parentItem.Index, subtask)
-			if err := m.storage.SaveList(list); err != nil {
-				debugLog.Printf("Error saving list %s: %v", list.Name, err)
-			}
-			updatedParent := list.Get(parentItem.Index)
-			if list.Name == "today" && updatedParent != nil && updatedParent.Source != "" {
-				m.storage.SyncSubtasksToSource(updatedParent)
-			} else if list.Name != "today" && updatedParent != nil {
-				m.storage.SyncCompletionToToday(list.Name, updatedParent)
-			}
+		if _, err := m.storage.AddSubtask(m.targetForItem(parentItem), subtask); err != nil {
+			debugLog.Printf("Error adding subtask: %v", err)
 		}
 
 		return m.loadTasks()()
@@ -252,116 +224,31 @@ func (m *TaskViewModel) filterTasks() {
 	}
 }
 
+func (m *TaskViewModel) targetForItem(item TaskItem) storage.TaskTarget {
+	listName := item.ListName
+	if listName == "" || (m.viewMode == ViewSingleList && !item.IsUpcoming) {
+		listName = m.listName
+	}
+	return storage.TaskTarget{
+		ListName:  listName,
+		Index:     item.Index,
+		SubIndex:  item.SubIndex,
+		IsSubtask: item.IsSubtask,
+		Content:   item.Task.Content,
+	}
+}
+
 func (m *TaskViewModel) toggleTask(idx int) tea.Cmd {
 	return func() tea.Msg {
 		if idx < 0 || idx >= len(m.items) {
 			return nil
 		}
 
-		item := m.items[idx]
-
-		// Handle upcoming items — operate directly on source list
-		if item.IsUpcoming {
-			list, err := m.storage.LoadList(item.ListName)
-			if err != nil {
-				return nil
-			}
-			for i, t := range list.Tasks {
-				if t.Content == item.Task.Content {
-					list.Toggle(i)
-					break
-				}
-			}
-			m.storage.SaveList(list)
-			return m.loadTasks()()
+		if _, err := m.storage.ToggleTask(m.targetForItem(m.items[idx])); err != nil {
+			debugLog.Printf("Error toggling task: %v", err)
 		}
-
-		if m.viewMode == ViewSingleList && m.taskList != nil {
-			if item.IsSubtask {
-				// Toggle subtask
-				parentIdx := m.findParentItemIdx(idx)
-				originalParentIndex := m.taskList.OriginalIndex(m.items[parentIdx].Task)
-				if originalParentIndex < 0 {
-					return nil
-				}
-				m.taskList.ToggleSubtask(originalParentIndex, item.SubIndex)
-
-				// Sync parent to source if on today list
-				if m.listName == "today" {
-					parent := m.taskList.Get(originalParentIndex)
-					if parent != nil && parent.Source != "" {
-						m.storage.SyncCompletionToSource(parent)
-					}
-				} else {
-					parent := m.taskList.Get(originalParentIndex)
-					if parent != nil {
-						m.storage.SyncCompletionToToday(m.listName, parent)
-					}
-				}
-			} else {
-				// Toggle parent task (existing logic)
-				originalIndex := m.taskList.OriginalIndex(item.Task)
-				if originalIndex < 0 {
-					return nil
-				}
-
-				toggled := m.taskList.Toggle(originalIndex)
-				m.handleRecurrence(toggled)
-
-				if m.listName == "today" && toggled != nil && toggled.Source != "" {
-					m.storage.SyncCompletionToSource(toggled)
-				} else if m.listName != "today" && toggled != nil {
-					m.storage.SyncCompletionToToday(m.listName, toggled)
-				}
-			}
-
-			if err := m.storage.SaveList(m.taskList); err != nil {
-				debugLog.Printf("Error saving list %s: %v", m.taskList.Name, err)
-			}
-		} else {
-			// All-tasks view
-			list, err := m.storage.LoadList(item.ListName)
-			if err != nil {
-				return nil
-			}
-
-			if item.IsSubtask {
-				list.ToggleSubtask(item.Index, item.SubIndex)
-				if item.Index >= 0 && item.Index < list.Len() {
-					parent := list.Get(item.Index)
-					if parent != nil && parent.Source != "" {
-						m.storage.SyncCompletionToSource(parent)
-					} else if parent != nil && item.ListName != "today" {
-						m.storage.SyncCompletionToToday(item.ListName, parent)
-					}
-				}
-			} else {
-				toggled := list.Toggle(item.Index)
-				m.storage.HandleRecurrence(toggled, list)
-				if toggled != nil && toggled.Source != "" {
-					m.storage.SyncCompletionToSource(toggled)
-				} else if toggled != nil && item.ListName != "today" {
-					m.storage.SyncCompletionToToday(item.ListName, toggled)
-				}
-			}
-
-			if err := m.storage.SaveList(list); err != nil {
-				debugLog.Printf("Error saving list %s: %v", list.Name, err)
-			}
-		}
-
 		return m.loadTasks()()
 	}
-}
-
-// findParentItemIdx walks backwards from a subtask item to find its parent TaskItem index.
-func (m *TaskViewModel) findParentItemIdx(subtaskIdx int) int {
-	for i := subtaskIdx - 1; i >= 0; i-- {
-		if !m.items[i].IsSubtask {
-			return i
-		}
-	}
-	return 0
 }
 
 // syncMetadataToSource propagates metadata changes from a today reference
@@ -393,76 +280,15 @@ func (m *TaskViewModel) syncMetadataToSource(todayTask *task.Task) {
 	}
 }
 
-func (m *TaskViewModel) handleRecurrence(toggled *task.Task) bool {
-	result := m.storage.HandleRecurrence(toggled, m.taskList)
-	return result != ""
-}
-
 func (m *TaskViewModel) deleteTask(idx int) tea.Cmd {
 	return func() tea.Msg {
 		if idx < 0 || idx >= len(m.items) {
 			return nil
 		}
 
-		item := m.items[idx]
-
-		// Handle upcoming items — delete from source list
-		if item.IsUpcoming {
-			list, err := m.storage.LoadList(item.ListName)
-			if err != nil {
-				return nil
-			}
-			for i, t := range list.Tasks {
-				if t.Content == item.Task.Content {
-					list.Delete(i)
-					break
-				}
-			}
-			m.storage.SaveList(list)
-			return m.loadTasks()()
+		if _, err := m.storage.DeleteTask(m.targetForItem(m.items[idx])); err != nil {
+			debugLog.Printf("Error deleting task: %v", err)
 		}
-
-		if m.viewMode == ViewSingleList && m.taskList != nil {
-			if item.IsSubtask {
-				parentIdx := m.findParentItemIdx(idx)
-				originalParentIndex := m.taskList.OriginalIndex(m.items[parentIdx].Task)
-				if originalParentIndex < 0 {
-					return nil
-				}
-				m.taskList.DeleteSubtask(originalParentIndex, item.SubIndex)
-			} else {
-				originalIndex := m.taskList.OriginalIndex(item.Task)
-				if originalIndex < 0 {
-					return nil
-				}
-				m.taskList.Delete(originalIndex)
-			}
-			if err := m.storage.SaveList(m.taskList); err != nil {
-				debugLog.Printf("Error saving list %s: %v", m.taskList.Name, err)
-			}
-		} else {
-			// If deleting a reference stub from the today list, remove only the stub
-			// (don't touch the source list).
-			listName := item.ListName
-			if item.Task.IsReference() {
-				listName = "today"
-			}
-
-			list, err := m.storage.LoadList(listName)
-			if err != nil {
-				return nil
-			}
-
-			if item.IsSubtask {
-				list.DeleteSubtask(item.Index, item.SubIndex)
-			} else {
-				list.Delete(item.Index)
-			}
-			if err := m.storage.SaveList(list); err != nil {
-				debugLog.Printf("Error saving list %s: %v", list.Name, err)
-			}
-		}
-
 		return m.loadTasks()()
 	}
 }

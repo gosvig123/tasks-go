@@ -13,11 +13,22 @@ import (
 	"github.com/krisitan/tasks-go/internal/ui"
 )
 
+type gistSyncClient interface {
+	IsConfigured() bool
+	Sync(tasksDir string) (*gist.Gist, error)
+}
+
 var (
 	store *storage.Storage
 
 	dueOffsetRe   = regexp.MustCompile(`\s+\+(\d+)(r)?$`)
 	validListName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	newGistClient = func() gistSyncClient {
+		return gist.NewClient()
+	}
+	pruneCompletedTasks = func() (int, error) {
+		return store.PruneCompletedTasks()
+	}
 )
 
 func main() {
@@ -262,41 +273,36 @@ func deleteTask(indexStr string) {
 	}
 
 	sorted := list.SortedTasks()
-
-	// Map user's sorted indices to original indices
-	type deleteEntry struct {
-		origIdx int
-		content string
-	}
-	var entries []deleteEntry
+	targets := make([]storage.TaskTarget, 0, len(indices))
 	for _, userIdx := range indices {
 		si := userIdx - 1
 		if si < 0 || si >= len(sorted) {
 			fmt.Printf("Index %d out of range\n", userIdx)
 			continue
 		}
-		origIdx := list.OriginalIndex(sorted[si])
-		entries = append(entries, deleteEntry{origIdx, sorted[si].Content})
+		targets = append(targets, storage.TaskTarget{
+			ListName: currentList,
+			Index:    list.OriginalIndex(sorted[si]),
+			SubIndex: -1,
+			Content:  sorted[si].Content,
+		})
 	}
 
-	// Delete highest original index first to avoid shift
-	for i := 0; i < len(entries); i++ {
-		for j := i + 1; j < len(entries); j++ {
-			if entries[j].origIdx > entries[i].origIdx {
-				entries[i], entries[j] = entries[j], entries[i]
+	// Delete highest original index first to avoid shift.
+	for i := 0; i < len(targets); i++ {
+		for j := i + 1; j < len(targets); j++ {
+			if targets[j].Index > targets[i].Index {
+				targets[i], targets[j] = targets[j], targets[i]
 			}
 		}
 	}
-	for _, e := range entries {
-		deleted := list.Delete(e.origIdx)
-		if deleted != nil {
-			fmt.Printf("✅ Deleted: %s\n", deleted.Content)
+	for _, target := range targets {
+		result, err := store.DeleteTask(target)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error deleting task: %v\n", err)
+			os.Exit(1)
 		}
-	}
-
-	if err := store.SaveList(list); err != nil {
-		fmt.Fprintf(os.Stderr, "Error saving list: %v\n", err)
-		os.Exit(1)
+		fmt.Printf("✅ Deleted: %s\n", result.Task.Content)
 	}
 }
 
@@ -315,48 +321,45 @@ func toggleTask(indexStr string) {
 	}
 
 	sorted := list.SortedTasks()
-
 	for _, userIdx := range indices {
 		si := userIdx - 1
 		if si < 0 || si >= len(sorted) {
 			fmt.Printf("Index %d out of range\n", userIdx)
 			continue
 		}
-		origIdx := list.OriginalIndex(sorted[si])
 
-		toggled := list.Toggle(origIdx)
-		if toggled == nil {
-			continue
+		result, err := store.ToggleTask(storage.TaskTarget{
+			ListName: currentList,
+			Index:    list.OriginalIndex(sorted[si]),
+			SubIndex: -1,
+			Content:  sorted[si].Content,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error toggling task: %v\n", err)
+			os.Exit(1)
 		}
 
 		status := "🔄 Reopened"
-		if toggled.Completed {
+		if result.Task.Completed {
 			status = "✅ Completed"
-
-			if addedTo := store.HandleRecurrence(toggled, list); addedTo != "" {
-				if addedTo == currentList {
-					fmt.Println("   ↳ Next occurrence created")
-				} else {
-					fmt.Printf("   ↳ Next occurrence added to '%s'\n", addedTo)
-				}
-			}
+			printRecurrence(result.RecurrenceList, currentList)
 		}
-
-		// Sync completion to source (both complete and uncomplete)
-		if currentList == "today" && toggled.Source != "" {
-			store.SyncCompletionToSource(toggled)
-			fmt.Printf("   ↳ Synced to '%s'\n", toggled.Source)
-		} else if currentList != "today" {
-			store.SyncCompletionToToday(currentList, toggled)
+		if result.SyncedToSource != "" {
+			fmt.Printf("   ↳ Synced to '%s'\n", result.SyncedToSource)
 		}
-
-		fmt.Printf("%s: %s\n", status, toggled.Content)
+		fmt.Printf("%s: %s\n", status, result.Task.Content)
 	}
+}
 
-	if err := store.SaveList(list); err != nil {
-		fmt.Fprintf(os.Stderr, "Error saving list: %v\n", err)
-		os.Exit(1)
+func printRecurrence(addedTo, currentList string) {
+	if addedTo == "" {
+		return
 	}
+	if addedTo == currentList {
+		fmt.Println("   ↳ Next occurrence created")
+		return
+	}
+	fmt.Printf("   ↳ Next occurrence added to '%s'\n", addedTo)
 }
 
 func handleListCommand(args []string) {
@@ -598,11 +601,16 @@ func dailyRefresh() {
 
 	// Sync to gist if configured and not synced today
 	if store.ShouldSyncToday() {
-		client := gist.NewClient()
+		client := newGistClient()
 		if client.IsConfigured() {
 			if _, err := client.Sync(store.TasksDir); err == nil {
 				store.MarkSyncDone()
 				fmt.Println("Auto-synced lists to gist")
+				if pruned, err := pruneCompletedTasks(); err == nil && pruned > 0 {
+					fmt.Printf("Pruned %d completed task(s) from source lists\n", pruned)
+				} else if err != nil {
+					fmt.Fprintf(os.Stderr, "Error pruning completed tasks: %v\n", err)
+				}
 			}
 		}
 	}

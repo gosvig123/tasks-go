@@ -22,6 +22,8 @@ type Storage struct {
 	syncDoneToday   bool
 }
 
+const completedTaskRetentionDays = 14
+
 func DefaultStorage() *Storage {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -481,6 +483,71 @@ func (s *Storage) MarkSyncDone() error {
 	}
 	s.syncDoneToday = true
 	return nil
+}
+
+func pruneCompletedTasksCutoff(now time.Time) time.Time {
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -completedTaskRetentionDays)
+}
+
+func shouldPruneCompletedTask(t *task.Task, cutoff time.Time) bool {
+	if !t.Completed || t.CompletedAt == nil {
+		return false
+	}
+
+	completedAt := time.Date(t.CompletedAt.Year(), t.CompletedAt.Month(), t.CompletedAt.Day(), 0, 0, 0, 0, cutoff.Location())
+	return !completedAt.After(cutoff)
+}
+
+func pruneCompletedTasks(tasks []*task.Task, cutoff time.Time) ([]*task.Task, int) {
+	kept := make([]*task.Task, 0, len(tasks))
+	pruned := 0
+
+	for _, t := range tasks {
+		if shouldPruneCompletedTask(t, cutoff) {
+			pruned++
+			continue
+		}
+		kept = append(kept, t)
+	}
+
+	return kept, pruned
+}
+
+func (s *Storage) PruneCompletedTasks() (int, error) {
+	return s.pruneCompletedTasksBefore(time.Now())
+}
+
+func (s *Storage) pruneCompletedTasksBefore(now time.Time) (int, error) {
+	lists, err := s.GetAllLists()
+	if err != nil {
+		return 0, err
+	}
+
+	cutoff := pruneCompletedTasksCutoff(now)
+	totalPruned := 0
+	for _, listName := range lists {
+		if listName == "today" {
+			continue
+		}
+
+		list, err := s.loadListRaw(listName)
+		if err != nil {
+			continue
+		}
+
+		kept, pruned := pruneCompletedTasks(list.Tasks, cutoff)
+		if pruned == 0 {
+			continue
+		}
+
+		list.Tasks = kept
+		if err := s.SaveList(list); err != nil {
+			return totalPruned, fmt.Errorf("saving pruned list %s: %w", list.Name, err)
+		}
+		totalPruned += pruned
+	}
+
+	return totalPruned, nil
 }
 
 // ResetTodayList resets today's list: reference stubs are replaced with

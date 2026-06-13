@@ -341,3 +341,178 @@ func TestResolveReferencesOverwritesCompletion(t *testing.T) {
 		t.Error("today stub CompletedAt should be nil after ResolveReferences")
 	}
 }
+
+func TestPruneCompletedTasksBefore(t *testing.T) {
+	store := newTestStorage(t)
+	now := time.Date(2026, 4, 15, 9, 0, 0, 0, time.Local)
+	oldDone := time.Date(2026, 4, 1, 18, 30, 0, 0, time.Local)
+	recentDone := time.Date(2026, 4, 2, 8, 0, 0, 0, time.Local)
+
+	work := task.NewTaskList("work")
+	work.Add(&task.Task{Content: "old completed", Completed: true, CompletedAt: &oldDone})
+	work.Add(&task.Task{Content: "recent completed", Completed: true, CompletedAt: &recentDone})
+	work.Add(&task.Task{Content: "pending task"})
+	work.Add(&task.Task{Content: "legacy completed", Completed: true})
+	if err := store.SaveList(work); err != nil {
+		t.Fatalf("SaveList(work): %v", err)
+	}
+
+	today := task.NewTaskList("today")
+	today.Add(&task.Task{Content: "today completed", Completed: true, CompletedAt: &oldDone})
+	if err := store.SaveList(today); err != nil {
+		t.Fatalf("SaveList(today): %v", err)
+	}
+
+	pruned, err := store.pruneCompletedTasksBefore(now)
+	if err != nil {
+		t.Fatalf("pruneCompletedTasksBefore: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("expected 1 pruned task, got %d", pruned)
+	}
+
+	workReloaded, err := store.loadListRaw("work")
+	if err != nil {
+		t.Fatalf("loadListRaw(work): %v", err)
+	}
+	if workReloaded.Len() != 3 {
+		t.Fatalf("expected 3 tasks in work after prune, got %d", workReloaded.Len())
+	}
+	if workReloaded.Tasks[0].Content != "recent completed" {
+		t.Errorf("expected recent completed first, got %q", workReloaded.Tasks[0].Content)
+	}
+	if workReloaded.Tasks[1].Content != "pending task" {
+		t.Errorf("expected pending task kept, got %q", workReloaded.Tasks[1].Content)
+	}
+	if workReloaded.Tasks[2].Content != "legacy completed" {
+		t.Errorf("expected completed task without CompletedAt kept, got %q", workReloaded.Tasks[2].Content)
+	}
+
+	todayReloaded, err := store.loadListRaw("today")
+	if err != nil {
+		t.Fatalf("loadListRaw(today): %v", err)
+	}
+	if todayReloaded.Len() != 1 {
+		t.Fatalf("expected today list to be skipped, got %d tasks", todayReloaded.Len())
+	}
+	if todayReloaded.Tasks[0].Content != "today completed" {
+		t.Errorf("expected today task unchanged, got %q", todayReloaded.Tasks[0].Content)
+	}
+}
+
+func TestToggleTaskTodayReferenceRecursBeforeSourceSync(t *testing.T) {
+	store := newTestStorage(t)
+	work := task.NewTaskList("work")
+	work.Add(&task.Task{Content: "Standup", RecurDays: 7})
+	if err := store.SaveList(work); err != nil {
+		t.Fatalf("SaveList(work): %v", err)
+	}
+
+	today := task.NewTaskList("today")
+	today.Add(task.NewReferenceStub(work.Tasks[0], "work"))
+	if err := store.SaveList(today); err != nil {
+		t.Fatalf("SaveList(today): %v", err)
+	}
+
+	result, err := store.ToggleTask(TaskTarget{ListName: "today", Index: 0, SubIndex: -1, Content: "Standup"})
+	if err != nil {
+		t.Fatalf("ToggleTask(today): %v", err)
+	}
+	if result.RecurrenceList != "work" || result.SyncedToSource != "work" {
+		t.Fatalf("expected recurrence and source sync to work, got %#v", result)
+	}
+
+	reloaded, err := store.loadListRaw("work")
+	if err != nil {
+		t.Fatalf("loadListRaw(work): %v", err)
+	}
+	if reloaded.Len() != 2 {
+		t.Fatalf("expected original plus recurrence, got %d", reloaded.Len())
+	}
+	if !reloaded.Tasks[0].Completed || reloaded.Tasks[1].Completed {
+		t.Fatalf("expected completed original and pending recurrence")
+	}
+}
+
+func TestToggleTaskSubtaskSyncsParentToSource(t *testing.T) {
+	store := newTestStorage(t)
+	parent := &task.Task{Content: "Project"}
+	parent.Subtasks = []*task.Task{{Content: "Draft", Parent: parent}}
+	work := task.NewTaskList("work")
+	work.Add(parent)
+	if err := store.SaveList(work); err != nil {
+		t.Fatalf("SaveList(work): %v", err)
+	}
+
+	today := task.NewTaskList("today")
+	today.Add(task.NewReferenceStub(parent, "work"))
+	if err := store.SaveList(today); err != nil {
+		t.Fatalf("SaveList(today): %v", err)
+	}
+
+	_, err := store.ToggleTask(TaskTarget{ListName: "today", Index: 0, SubIndex: 0, IsSubtask: true, Content: "Draft"})
+	if err != nil {
+		t.Fatalf("ToggleTask(subtask): %v", err)
+	}
+
+	reloaded, err := store.loadListRaw("work")
+	if err != nil {
+		t.Fatalf("loadListRaw(work): %v", err)
+	}
+	if !reloaded.Tasks[0].Subtasks[0].Completed {
+		t.Fatal("expected source subtask completed")
+	}
+}
+
+func TestDeleteTaskTodayReferenceOnlyRemovesStub(t *testing.T) {
+	store := newTestStorage(t)
+	work := task.NewTaskList("work")
+	work.Add(&task.Task{Content: "Buy milk"})
+	if err := store.SaveList(work); err != nil {
+		t.Fatalf("SaveList(work): %v", err)
+	}
+
+	today := task.NewTaskList("today")
+	today.Add(task.NewReferenceStub(work.Tasks[0], "work"))
+	if err := store.SaveList(today); err != nil {
+		t.Fatalf("SaveList(today): %v", err)
+	}
+
+	if _, err := store.DeleteTask(TaskTarget{ListName: "today", Index: 0, SubIndex: -1, Content: "Buy milk"}); err != nil {
+		t.Fatalf("DeleteTask(today): %v", err)
+	}
+
+	workReloaded, err := store.loadListRaw("work")
+	if err != nil {
+		t.Fatalf("loadListRaw(work): %v", err)
+	}
+	todayReloaded, err := store.loadListRaw("today")
+	if err != nil {
+		t.Fatalf("loadListRaw(today): %v", err)
+	}
+	if workReloaded.Len() != 1 || todayReloaded.Len() != 0 {
+		t.Fatalf("expected source kept and today cleared, got work=%d today=%d", workReloaded.Len(), todayReloaded.Len())
+	}
+}
+
+func TestTaskMutationContentFallback(t *testing.T) {
+	store := newTestStorage(t)
+	work := task.NewTaskList("work")
+	work.Add(&task.Task{Content: "Upcoming"})
+	if err := store.SaveList(work); err != nil {
+		t.Fatalf("SaveList(work): %v", err)
+	}
+
+	_, err := store.ToggleTask(TaskTarget{ListName: "work", Index: -1, SubIndex: -1, Content: "Upcoming"})
+	if err != nil {
+		t.Fatalf("ToggleTask(content fallback): %v", err)
+	}
+
+	reloaded, err := store.loadListRaw("work")
+	if err != nil {
+		t.Fatalf("loadListRaw(work): %v", err)
+	}
+	if !reloaded.Tasks[0].Completed {
+		t.Fatal("expected fallback target toggled")
+	}
+}
