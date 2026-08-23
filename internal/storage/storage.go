@@ -14,6 +14,7 @@ import (
 
 type Storage struct {
 	TasksDir        string
+	LockFile        string
 	CurrentListFile string
 	LastResetFile   string
 	LastSyncFile    string
@@ -30,8 +31,10 @@ func DefaultStorage() *Storage {
 		fmt.Fprintf(os.Stderr, "Error: could not determine home directory: %v\n", err)
 		os.Exit(1)
 	}
+	tasksDir := filepath.Join(home, "tasks-lists")
 	return &Storage{
-		TasksDir:        filepath.Join(home, "tasks-lists"),
+		TasksDir:        tasksDir,
+		LockFile:        filepath.Join(tasksDir, ".tasks.lock"),
 		CurrentListFile: filepath.Join(home, ".current-tasks-list"),
 		LastResetFile:   filepath.Join(home, ".tasks-today-last-reset"),
 		LastSyncFile:    filepath.Join(home, ".tasks-last-sync"),
@@ -81,30 +84,17 @@ func (s *Storage) LoadList(name string) (*task.TaskList, error) {
 // loadListRaw loads a task list without resolving references.
 func (s *Storage) loadListRaw(name string) (*task.TaskList, error) {
 	list := task.NewTaskList(name)
-	path := s.ListPath(name)
-
-	file, err := os.Open(path)
+	data, err := os.ReadFile(s.ListPath(name))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return list, nil
 		}
 		return nil, err
 	}
-	defer file.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+	list.LoadedRevision = revisionBytes(data)
+	for _, item := range task.ParseLines(strings.Split(string(data), "\n")) {
+		list.Add(item)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	for _, t := range task.ParseLines(lines) {
-		list.Add(t)
-	}
-
 	return list, nil
 }
 
@@ -129,13 +119,8 @@ func (s *Storage) ResolveReferences(todayList *task.TaskList) {
 			sourceList = loaded
 		}
 
-		// Find matching task by content in source list
-		content := strings.TrimSpace(t.Content)
-		for _, src := range sourceList.Tasks {
-			if strings.TrimSpace(src.Content) == content {
-				t.ResolveFrom(src)
-				break
-			}
+		if sourceTask := findTaskByIdentity(sourceList.Tasks, t); sourceTask != nil {
+			t.ResolveFrom(sourceTask)
 		}
 	}
 }
@@ -154,26 +139,20 @@ func (s *Storage) SyncCompletionToSource(todayTask *task.Task) {
 		return
 	}
 
-	todayContent := strings.TrimSpace(todayTask.Content)
-	for _, t := range sourceList.Tasks {
-		if strings.TrimSpace(t.Content) == todayContent {
-			t.Completed = todayTask.Completed
-			t.CompletedAt = todayTask.CompletedAt
-			for _, todaySub := range todayTask.Subtasks {
-				subContent := strings.TrimSpace(todaySub.Content)
-				for _, srcSub := range t.Subtasks {
-					if strings.TrimSpace(srcSub.Content) == subContent {
-						srcSub.Completed = todaySub.Completed
-						srcSub.CompletedAt = todaySub.CompletedAt
-						break
-					}
-				}
-			}
-			if err := s.SaveList(sourceList); err != nil {
-				fmt.Fprintf(os.Stderr, "Error saving list %s: %v\n", sourceList.Name, err)
-			}
-			break
+	sourceTask := findTaskByIdentity(sourceList.Tasks, todayTask)
+	if sourceTask == nil {
+		return
+	}
+	sourceTask.Completed = todayTask.Completed
+	sourceTask.CompletedAt = todayTask.CompletedAt
+	for _, todaySub := range todayTask.Subtasks {
+		if sourceSub := findTaskByIdentity(sourceTask.Subtasks, todaySub); sourceSub != nil {
+			sourceSub.Completed = todaySub.Completed
+			sourceSub.CompletedAt = todaySub.CompletedAt
 		}
+	}
+	if err := s.SaveList(sourceList); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving list %s: %v\n", sourceList.Name, err)
 	}
 }
 
@@ -189,25 +168,25 @@ func (s *Storage) SyncSubtasksToSource(todayTask *task.Task) {
 		return
 	}
 
-	todayContent := strings.TrimSpace(todayTask.Content)
 	for _, t := range sourceList.Tasks {
-		if strings.TrimSpace(t.Content) != todayContent {
+		if !sameTask(t, todayTask) {
 			continue
 		}
 
 		existing := make(map[string]*task.Task)
 		for _, srcSub := range t.Subtasks {
-			existing[strings.TrimSpace(srcSub.Content)] = srcSub
+			existing[identityKey(srcSub)] = srcSub
 		}
 
 		changed := false
 		for _, todaySub := range todayTask.Subtasks {
-			key := strings.TrimSpace(todaySub.Content)
+			key := identityKey(todaySub)
 			if _, ok := existing[key]; ok {
 				continue
 			}
 
 			newSub := &task.Task{
+				ID:          todaySub.ID,
 				Content:     todaySub.Content,
 				Description: todaySub.Description,
 				Completed:   todaySub.Completed,
@@ -241,12 +220,8 @@ func (s *Storage) SyncCompletionToToday(sourceListName string, sourceTask *task.
 		return
 	}
 
-	srcContent := strings.TrimSpace(sourceTask.Content)
 	for _, t := range todayList.Tasks {
-		if t.Source != sourceListName {
-			continue
-		}
-		if strings.TrimSpace(t.Content) != srcContent {
+		if t.Source != sourceListName || !sameTask(t, sourceTask) {
 			continue
 		}
 		t.ResolveFrom(sourceTask)
@@ -277,11 +252,8 @@ func (s *Storage) HandleRecurrence(toggled *task.Task, currentList *task.TaskLis
 			return ""
 		}
 
-		toggledContent := strings.TrimSpace(toggled.Content)
-		for _, t := range sourceList.Tasks {
-			if strings.TrimSpace(t.Content) == toggledContent && t.Completed {
-				return ""
-			}
+		if recurrenceExists(sourceList.Tasks, nextTask) {
+			return ""
 		}
 
 		sourceList.Add(nextTask)
@@ -295,35 +267,29 @@ func (s *Storage) HandleRecurrence(toggled *task.Task, currentList *task.TaskLis
 	return currentList.Name
 }
 
-// SaveList saves a task list to disk using atomic write (temp + fsync + rename)
-// to prevent data loss if the process is interrupted mid-write.
+// SaveList saves a list atomically while preserving non-task Markdown.
 func (s *Storage) SaveList(list *task.TaskList) error {
 	if err := s.EnsureDir(); err != nil {
 		return err
 	}
-
 	path := s.ListPath(list.Name)
-	tmp := path + ".tmp"
-	file, err := os.Create(tmp)
+	original, structured, err := readStructuredFile(path)
 	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
+		return err
 	}
-
-	for _, t := range list.Tasks {
-		fmt.Fprintln(file, t.String())
+	if structured {
+		err = s.saveStructuredList(list, original)
+	} else {
+		content := strings.Join(migratedLines(list), "\n")
+		if content != "" {
+			content += "\n"
+		}
+		err = writeAtomicText(path, content)
 	}
-
-	if err := file.Sync(); err != nil {
-		file.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("syncing temp file: %w", err)
+	if err != nil {
+		return err
 	}
-	if err := file.Close(); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("closing temp file: %w", err)
-	}
-
-	return os.Rename(tmp, path)
+	return s.refreshLoadedRevision(list)
 }
 
 // GetAllLists returns names of all available lists
@@ -377,7 +343,10 @@ func (s *Storage) DeleteList(name string) error {
 	// Remove references to the deleted list from today's list
 	todayList, err := s.loadListRaw("today")
 	if err != nil {
-		return nil // today list missing or unreadable — not an error
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
 	var kept []*task.Task
 	for _, t := range todayList.Tasks {
@@ -385,11 +354,11 @@ func (s *Storage) DeleteList(name string) error {
 			kept = append(kept, t)
 		}
 	}
-	if len(kept) != len(todayList.Tasks) {
-		todayList.Tasks = kept
-		_ = s.SaveList(todayList)
+	if len(kept) == len(todayList.Tasks) {
+		return nil
 	}
-	return nil
+	todayList.Tasks = kept
+	return s.SaveList(todayList)
 }
 
 // RenameList renames a list and updates any @source: references to it
@@ -409,7 +378,10 @@ func (s *Storage) RenameList(oldName, newName string) error {
 	// Update @source: references in today's list
 	todayList, err := s.loadListRaw("today")
 	if err != nil {
-		return nil // today list missing or unreadable — not an error
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
 	changed := false
 	for _, t := range todayList.Tasks {
@@ -418,10 +390,10 @@ func (s *Storage) RenameList(oldName, newName string) error {
 			changed = true
 		}
 	}
-	if changed {
-		_ = s.SaveList(todayList)
+	if !changed {
+		return nil
 	}
-	return nil
+	return s.SaveList(todayList)
 }
 
 // ListExists checks if a list exists

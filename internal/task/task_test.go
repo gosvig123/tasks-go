@@ -198,16 +198,19 @@ func TestResolveFromWithSubtasks(t *testing.T) {
 	}
 
 	stub := &Task{
-		Content: "Write proposal",
+		Content: "Old proposal title",
 		Source:  "work",
 		Subtasks: []*Task{
-			{Content: "Research", Source: "work"},
+			{Content: "Old research title", Source: "work"},
 			{Content: "Draft", Source: "work"},
 		},
 	}
 
 	stub.ResolveFrom(source)
 
+	if stub.Content != "Write proposal" || stub.Subtasks[0].Content != "Research" {
+		t.Fatal("expected task and subtask titles to be resolved from source")
+	}
 	if stub.Subtasks[0].Estimate == nil {
 		t.Error("expected subtask estimate to be resolved from source")
 	}

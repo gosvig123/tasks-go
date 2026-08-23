@@ -6,8 +6,9 @@ import (
 )
 
 type TaskList struct {
-	Name  string
-	Tasks []*Task
+	Name           string
+	LoadedRevision string
+	Tasks          []*Task
 }
 
 func NewTaskList(name string) *TaskList {
@@ -24,6 +25,7 @@ func (l *TaskList) Add(task *Task) {
 func (l *TaskList) AddContent(content string, description string, dueOffset int, recurDays int) *Task {
 	now := time.Now()
 	task := &Task{
+		ID:          NewID(),
 		Content:     content,
 		Description: description,
 		Completed:   false,
@@ -80,6 +82,7 @@ func (l *TaskList) AddSubtask(parentIndex int, subtask *Task) *Task {
 	if parent == nil {
 		return nil
 	}
+	subtask.EnsureID()
 	subtask.Parent = parent
 	parent.Subtasks = append(parent.Subtasks, subtask)
 	return subtask

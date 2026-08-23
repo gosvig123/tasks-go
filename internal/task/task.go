@@ -9,6 +9,7 @@ import (
 )
 
 type Task struct {
+	ID          string
 	Content     string
 	Description string // Optional description for the task
 	Completed   bool
@@ -38,6 +39,7 @@ func (t TimeOfDay) ToMinutes() int {
 }
 
 var (
+	idRegex      = regexp.MustCompile(`@id:([0-9a-fA-F-]{32,36})`)
 	dueRegex     = regexp.MustCompile(`@due:(\d{4}-\d{2}-\d{2})`)
 	doneRegex    = regexp.MustCompile(`@done:(\d{4}-\d{2}-\d{2})`)
 	recurRegex   = regexp.MustCompile(`@recur:(\d+)`)
@@ -82,6 +84,12 @@ func Parse(line string) (*Task, error) {
 		}
 		line = createdRegex.ReplaceAllString(line, "")
 		line = strings.TrimSpace(line)
+	}
+
+	// Extract stable identity.
+	if match := idRegex.FindStringSubmatch(line); len(match) > 1 {
+		task.ID = strings.ToLower(match[1])
+		line = idRegex.ReplaceAllString(line, "")
 	}
 
 	// Extract due date
@@ -230,6 +238,11 @@ func (t *Task) String() string {
 
 	sb.WriteString(t.Content)
 
+	if t.ID != "" {
+		sb.WriteString(" @id:")
+		sb.WriteString(t.ID)
+	}
+
 	if t.DueDate != nil {
 		sb.WriteString(" @due:")
 		sb.WriteString(t.DueDate.Format("2006-01-02"))
@@ -331,6 +344,7 @@ func (t *Task) IsReference() bool {
 // All metadata is copied so it persists even if resolution fails.
 func NewReferenceStub(t *Task, source string) *Task {
 	stub := &Task{
+		ID:          t.ID,
 		Content:     t.Content,
 		Source:      source,
 		DueDate:     t.DueDate,
@@ -342,6 +356,7 @@ func NewReferenceStub(t *Task, source string) *Task {
 	}
 	for _, sub := range t.Subtasks {
 		stubSub := &Task{
+			ID:        sub.ID,
 			Content:   sub.Content,
 			Completed: sub.Completed,
 			Source:    source,
@@ -356,9 +371,12 @@ func NewReferenceStub(t *Task, source string) *Task {
 // Source is the single truth for scheduling/identity fields (DueDate, RecurDays,
 // Description, CreatedAt, completion). These are always overwritten, even when
 // the source value is nil/zero, so removals propagate to today stubs.
-// Estimate and StartTime are only overwritten when source has a value — they
-// may be set locally on the today task for per-day overrides.
+// Estimate and StartTime are authoritative on the source task, including clears.
 func (t *Task) ResolveFrom(source *Task) {
+	if t.ID == "" {
+		t.ID = source.ID
+	}
+	t.Content = source.Content
 	t.Completed = source.Completed
 	t.CompletedAt = source.CompletedAt
 
@@ -368,53 +386,48 @@ func (t *Task) ResolveFrom(source *Task) {
 	t.Description = source.Description
 	t.CreatedAt = source.CreatedAt
 
-	// Additive: only overwrite when source has a value (may be set locally on today)
-	if source.Estimate != nil {
-		t.Estimate = source.Estimate
-	}
-	if source.StartTime != nil {
-		t.StartTime = source.StartTime
-	}
+	t.Estimate = source.Estimate
+	t.StartTime = source.StartTime
 
 	existing := make(map[string]*Task)
 	for _, sub := range t.Subtasks {
-		existing[strings.TrimSpace(sub.Content)] = sub
+		existing[subtaskKey(sub)] = sub
 	}
 
 	resolved := make([]*Task, 0, len(source.Subtasks))
 	for _, srcSub := range source.Subtasks {
-		key := strings.TrimSpace(srcSub.Content)
-		sub, ok := existing[key]
+		sub, ok := existing[subtaskKey(srcSub)]
 		if !ok {
-			sub = &Task{
-				Content: srcSub.Content,
-				Source:  t.Source,
-				Parent:  t,
-			}
+			sub = &Task{ID: srcSub.ID, Content: srcSub.Content, Source: t.Source, Parent: t}
 		} else {
 			sub.Parent = t
+			sub.ID = srcSub.ID
 			if sub.Source == "" {
 				sub.Source = t.Source
 			}
 		}
 
+		sub.Content = srcSub.Content
 		sub.Completed = srcSub.Completed
 		sub.CompletedAt = srcSub.CompletedAt
 		sub.DueDate = srcSub.DueDate
 		sub.RecurDays = srcSub.RecurDays
 		sub.Description = srcSub.Description
 		sub.CreatedAt = srcSub.CreatedAt
-		if srcSub.Estimate != nil {
-			sub.Estimate = srcSub.Estimate
-		}
-		if srcSub.StartTime != nil {
-			sub.StartTime = srcSub.StartTime
-		}
+		sub.Estimate = srcSub.Estimate
+		sub.StartTime = srcSub.StartTime
 
 		resolved = append(resolved, sub)
 	}
 
 	t.Subtasks = resolved
+}
+
+func subtaskKey(t *Task) string {
+	if t.ID != "" {
+		return "id:" + t.ID
+	}
+	return "content:" + strings.TrimSpace(t.Content)
 }
 
 // AllSubtasksCompleted returns true if all subtasks are completed (or there are none).
@@ -463,6 +476,7 @@ func (t *Task) CreateNextRecurrence() *Task {
 	now := time.Now()
 
 	return &Task{
+		ID:          NewID(),
 		Content:     t.Content,
 		Description: t.Description,
 		Completed:   false,

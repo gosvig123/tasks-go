@@ -34,6 +34,9 @@ var (
 func main() {
 	store = storage.DefaultStorage()
 	store.EnsureDir()
+	if runMachineCommand(os.Args[1:]) {
+		return
+	}
 
 	// Perform daily maintenance (today list refresh, gist sync)
 	dailyRefresh()
@@ -847,6 +850,10 @@ func showHelp() {
 	fmt.Println("  tasks sync schedule       - Set up daily sync at 12:00 PM")
 	fmt.Println()
 	fmt.Println("Other:")
+	fmt.Println("  tasks api lists          - List task lists as versioned JSON")
+	fmt.Println("  tasks api snapshot --list today - Output versioned JSON")
+	fmt.Println("  tasks api exec            - Apply one JSON mutation from stdin")
+	fmt.Println("  tasks migrate ids [--dry-run] - Add stable task IDs")
 	fmt.Println("  tasks starship            - Output for Starship prompt")
 	fmt.Println("  tasks help                - Show this help")
 	fmt.Println()
