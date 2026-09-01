@@ -302,7 +302,7 @@ func (m *TaskViewModel) syncListCursorFromTimeline() {
 
 func (m *TaskViewModel) saveAndSyncTimeline(t *task.Task) {
 	if m.taskList != nil {
-		if err := m.storage.SaveList(m.taskList); err != nil {
+		if err := m.storage.SaveListLocked(m.taskList); err != nil {
 			debugLog.Printf("Error saving list %s: %v", m.taskList.Name, err)
 		}
 	}

@@ -68,11 +68,11 @@ func main() {
 			fmt.Println("Usage: tasks add 'task content'")
 			os.Exit(1)
 		}
-		// Special case: "add today" populates today's list with due tasks
+		// The interactive Today picker locks each mutation itself.
 		if args[0] == "today" && len(args) == 1 {
 			addToday()
 		} else {
-			addTask(strings.Join(args, " "))
+			runLocked(func() { addTask(strings.Join(args, " ")) })
 		}
 
 	// Delete task
@@ -392,14 +392,14 @@ func handleListCommand(args []string) {
 			fmt.Println("Usage: tasks list add <name>")
 			os.Exit(1)
 		}
-		createList(subargs[0])
+		runLocked(func() { createList(subargs[0]) })
 
 	case "d", "delete", "del", "remove":
 		if len(subargs) == 0 {
 			fmt.Println("Usage: tasks list delete <name>")
 			os.Exit(1)
 		}
-		deleteList(subargs[0])
+		runLocked(func() { deleteList(subargs[0]) })
 
 	case "s", "switch", "sw":
 		if len(subargs) == 0 {
@@ -413,7 +413,7 @@ func handleListCommand(args []string) {
 			fmt.Println("Usage: tasks list rename <old-name> <new-name>")
 			os.Exit(1)
 		}
-		renameList(subargs[0], subargs[1])
+		runLocked(func() { renameList(subargs[0], subargs[1]) })
 
 	default:
 		// Check if it's a number for quick switch
@@ -597,25 +597,52 @@ func debugAllTasks() {
 // - Resets the today list (clears and repopulates with due tasks)
 // - Syncs all lists to gist if configured
 func dailyRefresh() {
-	// Always reset today's list on a new day
-	if added, _ := store.ResetTodayList(); added > 0 {
+	if added := refreshToday(); added > 0 {
 		fmt.Printf("Auto-refreshed today's list with %d due task(s)\n", added)
 	}
+	if !store.ShouldSyncToday() {
+		return
+	}
 
-	// Sync to gist if configured and not synced today
-	if store.ShouldSyncToday() {
-		client := newGistClient()
-		if client.IsConfigured() {
-			if _, err := client.Sync(store.TasksDir); err == nil {
-				store.MarkSyncDone()
-				fmt.Println("Auto-synced lists to gist")
-				if pruned, err := pruneCompletedTasks(); err == nil && pruned > 0 {
-					fmt.Printf("Pruned %d completed task(s) from source lists\n", pruned)
-				} else if err != nil {
-					fmt.Fprintf(os.Stderr, "Error pruning completed tasks: %v\n", err)
-				}
-			}
-		}
+	client := newGistClient()
+	if !client.IsConfigured() {
+		return
+	}
+	if _, err := client.Sync(store.TasksDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Gist auto-sync failed: %v\n", err)
+		return
+	}
+	store.MarkSyncDone()
+	fmt.Println("Auto-synced lists to gist")
+	reportPrunedTasks()
+}
+
+func refreshToday() int {
+	added := 0
+	err := store.WithLock(func() error {
+		var resetErr error
+		added, resetErr = store.ResetTodayList()
+		return resetErr
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error refreshing Today: %v\n", err)
+	}
+	return added
+}
+
+func reportPrunedTasks() {
+	pruned := 0
+	err := store.WithLock(func() error {
+		var pruneErr error
+		pruned, pruneErr = pruneCompletedTasks()
+		return pruneErr
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error pruning completed tasks: %v\n", err)
+		return
+	}
+	if pruned > 0 {
+		fmt.Printf("Pruned %d completed task(s) from source lists\n", pruned)
 	}
 }
 
@@ -678,6 +705,7 @@ func handleSyncCommand(args []string) {
 			fmt.Fprintf(os.Stderr, "Sync failed: %v\n", err)
 			os.Exit(1)
 		}
+		store.MarkSyncDone()
 		fmt.Printf("Synced to: %s\n", g.HTMLURL)
 		return
 	}
@@ -711,6 +739,17 @@ func handleSyncCommand(args []string) {
 		fmt.Println()
 		fmt.Println("To set up daily sync at noon, run:")
 		fmt.Println("  tasks sync schedule")
+
+	case "reauth":
+		if len(subargs) == 0 {
+			fmt.Println("Usage: tasks sync reauth <github-token>")
+			os.Exit(1)
+		}
+		if err := client.UpdateToken(subargs[0]); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to update token: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Gist token updated.")
 
 	case "status":
 		if !client.IsConfigured() {
@@ -846,6 +885,7 @@ func showHelp() {
 	fmt.Println("Sync Commands:")
 	fmt.Println("  tasks sync                - Sync tasks to GitHub Gist")
 	fmt.Println("  tasks sync init <token>   - Initialize gist backup with GitHub token")
+	fmt.Println("  tasks sync reauth <token> - Update stored GitHub token")
 	fmt.Println("  tasks sync status         - Show sync status")
 	fmt.Println("  tasks sync schedule       - Set up daily sync at 12:00 PM")
 	fmt.Println()

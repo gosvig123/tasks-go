@@ -8,6 +8,7 @@ import (
 
 // TaskTarget identifies a top-level task or subtask for storage mutations.
 type TaskTarget struct {
+	ID        string
 	ListName  string
 	Index     int
 	SubIndex  int
@@ -27,6 +28,16 @@ type TaskMutationResult struct {
 
 // ToggleTask toggles a task and owns recurrence plus today/source sync.
 func (s *Storage) ToggleTask(target TaskTarget) (*TaskMutationResult, error) {
+	var result *TaskMutationResult
+	err := s.WithLock(func() error {
+		var actionErr error
+		result, actionErr = s.toggleTask(target)
+		return actionErr
+	})
+	return result, err
+}
+
+func (s *Storage) toggleTask(target TaskTarget) (*TaskMutationResult, error) {
 	list, target, err := s.loadMutationList(target)
 	if err != nil {
 		return nil, err
@@ -43,6 +54,16 @@ func (s *Storage) ToggleTask(target TaskTarget) (*TaskMutationResult, error) {
 
 // DeleteTask deletes a task from its owning list.
 func (s *Storage) DeleteTask(target TaskTarget) (*TaskMutationResult, error) {
+	var result *TaskMutationResult
+	err := s.WithLock(func() error {
+		var actionErr error
+		result, actionErr = s.deleteTask(target)
+		return actionErr
+	})
+	return result, err
+}
+
+func (s *Storage) deleteTask(target TaskTarget) (*TaskMutationResult, error) {
 	list, target, err := s.loadMutationList(target)
 	if err != nil {
 		return nil, err
@@ -60,6 +81,16 @@ func (s *Storage) DeleteTask(target TaskTarget) (*TaskMutationResult, error) {
 
 // AddSubtask adds a subtask to a parent task and syncs the changed parent.
 func (s *Storage) AddSubtask(target TaskTarget, subtask *task.Task) (*TaskMutationResult, error) {
+	var result *TaskMutationResult
+	err := s.WithLock(func() error {
+		var actionErr error
+		result, actionErr = s.addSubtask(target, subtask)
+		return actionErr
+	})
+	return result, err
+}
+
+func (s *Storage) addSubtask(target TaskTarget, subtask *task.Task) (*TaskMutationResult, error) {
 	if subtask == nil {
 		return nil, fmt.Errorf("subtask is nil")
 	}

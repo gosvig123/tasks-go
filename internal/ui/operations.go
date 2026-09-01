@@ -47,7 +47,7 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 					break
 				}
 			}
-			if err := m.storage.SaveList(list); err != nil {
+			if err := m.storage.SaveListLocked(list); err != nil {
 				debugLog.Printf("Error saving list %s: %v", list.Name, err)
 			}
 			m.inputMode = InputNormal
@@ -86,7 +86,7 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 		// and return a lightweight refresh instead of a full disk reload so the cursor
 		// stays on the edited task and the timeline updates immediately.
 		if m.viewMode == ViewSingleList && m.taskList != nil {
-			if err := m.storage.SaveList(m.taskList); err != nil {
+			if err := m.storage.SaveListLocked(m.taskList); err != nil {
 				debugLog.Printf("Error saving list %s: %v", m.taskList.Name, err)
 			}
 
@@ -97,7 +97,7 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 					// Task is no longer due today — remove stub and do a full reload
 					// (cursor reset is acceptable since the task disappears from the list)
 					m.taskList.Delete(item.Index)
-					if err := m.storage.SaveList(m.taskList); err != nil {
+					if err := m.storage.SaveListLocked(m.taskList); err != nil {
 						debugLog.Printf("Error saving list %s: %v", m.taskList.Name, err)
 					}
 					m.inputMode = InputNormal
@@ -128,7 +128,7 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 					sub.StartTime = startTime
 				}
 			}
-			if err := m.storage.SaveList(list); err != nil {
+			if err := m.storage.SaveListLocked(list); err != nil {
 				debugLog.Printf("Error saving list %s: %v", list.Name, err)
 			}
 		} else if item.Index < len(list.Tasks) {
@@ -138,7 +138,7 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 			list.Tasks[item.Index].RecurDays = recurDays
 			list.Tasks[item.Index].Estimate = estimate
 			list.Tasks[item.Index].StartTime = startTime
-			if err := m.storage.SaveList(list); err != nil {
+			if err := m.storage.SaveListLocked(list); err != nil {
 				debugLog.Printf("Error saving list %s: %v", list.Name, err)
 			}
 		}
@@ -149,7 +149,7 @@ func (m *TaskViewModel) saveEditedTask(content, description, dueValue, recurValu
 			if !item.Task.IsDueToday() {
 				if item.Index < len(list.Tasks) {
 					list.Delete(item.Index)
-					if err := m.storage.SaveList(list); err != nil {
+					if err := m.storage.SaveListLocked(list); err != nil {
 						debugLog.Printf("Error saving list %s: %v", list.Name, err)
 					}
 				}
@@ -230,6 +230,7 @@ func (m *TaskViewModel) targetForItem(item TaskItem) storage.TaskTarget {
 		listName = m.listName
 	}
 	return storage.TaskTarget{
+		ID:        item.Task.ID,
 		ListName:  listName,
 		Index:     item.Index,
 		SubIndex:  item.SubIndex,
@@ -275,7 +276,7 @@ func (m *TaskViewModel) syncMetadataToSource(todayTask *task.Task) {
 		}
 	}
 
-	if err := m.storage.SaveList(sourceList); err != nil {
+	if err := m.storage.SaveListLocked(sourceList); err != nil {
 		debugLog.Printf("Error saving list %s: %v", sourceList.Name, err)
 	}
 }
@@ -395,7 +396,7 @@ func (m *TaskViewModel) addTaskWithOptions(content, description, dueValue, recur
 			}
 			t.Estimate = estimate
 			t.StartTime = startTime
-			if err := m.storage.SaveList(m.taskList); err != nil {
+			if err := m.storage.SaveListLocked(m.taskList); err != nil {
 				debugLog.Printf("Error saving list %s: %v", m.taskList.Name, err)
 			}
 		} else if m.viewMode == ViewAllPending && m.cursor < len(m.items) {
@@ -414,7 +415,7 @@ func (m *TaskViewModel) addTaskWithOptions(content, description, dueValue, recur
 			}
 			t.Estimate = estimate
 			t.StartTime = startTime
-			if err := m.storage.SaveList(list); err != nil {
+			if err := m.storage.SaveListLocked(list); err != nil {
 				debugLog.Printf("Error saving list %s: %v", list.Name, err)
 			}
 		} else {
@@ -453,7 +454,7 @@ func (m *TaskViewModel) addTaskToList(content string, description string, listNa
 		}
 		t.Estimate = estimate
 		t.StartTime = startTime
-		if err := m.storage.SaveList(list); err != nil {
+		if err := m.storage.SaveListLocked(list); err != nil {
 			debugLog.Printf("Error saving list %s: %v", list.Name, err)
 		}
 
@@ -498,7 +499,7 @@ func (m *TaskViewModel) ensureDueDateOnSource(t *task.Task, sourceList string) {
 			break
 		}
 	}
-	if err := m.storage.SaveList(list); err != nil {
+	if err := m.storage.SaveListLocked(list); err != nil {
 		debugLog.Printf("Error saving list %s: %v", list.Name, err)
 	}
 }
@@ -519,7 +520,7 @@ func (m *TaskViewModel) addSelectedToToday() tea.Cmd {
 		}
 
 		if added > 0 {
-			if err := m.storage.SaveList(todayList); err != nil {
+			if err := m.storage.SaveListLocked(todayList); err != nil {
 				debugLog.Printf("Error saving list %s: %v", todayList.Name, err)
 			}
 		}
@@ -553,7 +554,7 @@ func (m *TaskViewModel) addCurrentTaskToToday() tea.Cmd {
 
 		todayList := m.getOrCreateTodayList()
 		todayList.Add(task.NewReferenceStub(item.Task, sourceList))
-		if err := m.storage.SaveList(todayList); err != nil {
+		if err := m.storage.SaveListLocked(todayList); err != nil {
 			debugLog.Printf("Error saving list %s: %v", todayList.Name, err)
 		}
 

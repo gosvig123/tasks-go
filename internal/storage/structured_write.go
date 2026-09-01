@@ -32,13 +32,9 @@ func (s *Storage) saveStructuredList(list *task.TaskList, original string) error
 }
 
 func serializedEntries(list *task.TaskList) []*serializedLine {
-	lines := migratedLines(list)
-	entries := make([]*serializedLine, 0, len(lines))
-	for _, line := range lines {
-		parsed, err := task.Parse(strings.TrimSpace(line))
-		if err == nil {
-			entries = append(entries, &serializedLine{key: documentKey(parsed), text: line})
-		}
+	entries := make([]*serializedLine, 0, len(list.Tasks))
+	for _, item := range list.Tasks {
+		entries = append(entries, &serializedLine{key: documentKey(item), text: item.String()})
 	}
 	return entries
 }

@@ -52,7 +52,7 @@ func (s *Service) mutateTask(request Request) error {
 	if err != nil {
 		return err
 	}
-	return s.saveCanonical(located)
+	return s.saveCanonical(located, request.Changes)
 }
 
 func (s *Service) completeTask(located *locatedTask, changes TaskChanges) error {
@@ -67,14 +67,26 @@ func (s *Service) completeTask(located *locatedTask, changes TaskChanges) error 
 	return nil
 }
 
-func (s *Service) saveCanonical(located *locatedTask) error {
+func (s *Service) saveCanonical(located *locatedTask, changes TaskChanges) error {
 	if err := s.Store.SaveList(located.List); err != nil {
 		return err
 	}
-	if located.ListName != ListToday {
-		s.Store.SyncCompletionToToday(located.ListName, located.Task)
+	if located.ListName == ListToday {
+		return nil
 	}
-	return nil
+	s.Store.SyncCompletionToToday(located.ListName, located.Task)
+	return s.removeNonTodayReference(located.Task, changes)
+}
+
+func (s *Service) removeNonTodayReference(item *task.Task, changes TaskChanges) error {
+	if changes.DueDate == nil || item.IsDueToday() {
+		return nil
+	}
+	err := s.removeTodayReference(item.ID)
+	if typed, ok := err.(*Error); ok && typed.Code == CodeNotFound {
+		return nil
+	}
+	return err
 }
 
 func (s *Service) deleteTask(located *locatedTask) error {

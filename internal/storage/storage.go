@@ -642,6 +642,12 @@ func (s *Storage) GetAllListInfo() ([]*ListInfo, error) {
 // If source is non-empty, the tracked time is saved to the source list instead
 // (for today-list references that should persist across daily resets).
 func (s *Storage) SaveTaskTracked(listName, content, source string, tracked time.Duration) error {
+	return s.WithLock(func() error {
+		return s.saveTaskTracked(listName, content, source, tracked)
+	})
+}
+
+func (s *Storage) saveTaskTracked(listName, content, source string, tracked time.Duration) error {
 	saveList := listName
 	if source != "" {
 		saveList = source

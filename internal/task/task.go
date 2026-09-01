@@ -44,7 +44,6 @@ var (
 	doneRegex    = regexp.MustCompile(`@done:(\d{4}-\d{2}-\d{2})`)
 	recurRegex   = regexp.MustCompile(`@recur:(\d+)`)
 	sourceRegex  = regexp.MustCompile(`@source:(?:"([^"]+)"|([a-zA-Z0-9_-]+))`)
-	descRegex    = regexp.MustCompile(`@desc:"([^"]*)"`)
 	estRegex     = regexp.MustCompile(`@est:(\d+h)?(\d+m)?`)
 	trackedRegex = regexp.MustCompile(`@tracked:(\d+h)?(\d+m)?(\d+s)?`)
 	startRegex   = regexp.MustCompile(`@at:(\d{1,2}:\d{2})`)
@@ -125,9 +124,9 @@ func Parse(line string) (*Task, error) {
 	}
 
 	// Extract description
-	if match := descRegex.FindStringSubmatch(line); len(match) > 1 {
-		task.Description = match[1]
-		line = descRegex.ReplaceAllString(line, "")
+	if description, remainder, ok := extractDescription(line); ok {
+		task.Description = description
+		line = remainder
 	}
 
 	// Extract estimate
@@ -195,35 +194,41 @@ func Parse(line string) (*Task, error) {
 func ParseLines(lines []string) []*Task {
 	var tasks []*Task
 	var currentParent *Task
-
 	for _, line := range lines {
-		if strings.TrimSpace(line) == "" {
+		parsed, ok := parseTaskLine(line)
+		if !ok {
 			continue
 		}
-
 		isIndented := strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ")
-
 		if isIndented && currentParent != nil {
-			parsed, err := Parse(strings.TrimPrefix(line, "  "))
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "warning: skipping malformed task line: %q\n", strings.TrimSpace(line))
-				continue
-			}
 			parsed.Parent = currentParent
 			currentParent.Subtasks = append(currentParent.Subtasks, parsed)
-		} else {
-			trimmed := strings.TrimSpace(line)
-			parsed, err := Parse(trimmed)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "warning: skipping malformed task line: %q\n", trimmed)
-				continue
-			}
-			tasks = append(tasks, parsed)
-			currentParent = parsed
+			continue
 		}
+		tasks = append(tasks, parsed)
+		currentParent = parsed
 	}
-
 	return tasks
+}
+
+func parseTaskLine(line string) (*Task, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !hasTaskMarker(trimmed) {
+		return nil, false
+	}
+	parsed, err := Parse(trimmed)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: skipping malformed task line: %q\n", trimmed)
+		return nil, false
+	}
+	return parsed, true
+}
+
+func hasTaskMarker(line string) bool {
+	return strings.HasPrefix(line, "[x]") ||
+		strings.HasPrefix(line, "[X]") ||
+		strings.HasPrefix(line, "[ ]") ||
+		strings.HasPrefix(line, "[]")
 }
 
 // String converts the task back to file format
@@ -303,7 +308,7 @@ func (t *Task) String() string {
 
 	if t.Description != "" {
 		sb.WriteString(" @desc:\"")
-		sb.WriteString(t.Description)
+		sb.WriteString(encodeDescription(t.Description))
 		sb.WriteString("\"")
 	}
 

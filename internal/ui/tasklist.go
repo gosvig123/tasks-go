@@ -190,7 +190,7 @@ func (m *TaskViewModel) loadSingleList() tea.Msg {
 
 	isToday := listName == "today"
 	if isToday {
-		m.storage.ResetTodayList()
+		m.storage.ResetTodayListLocked()
 	}
 
 	taskList, err := m.storage.LoadList(listName)
@@ -276,7 +276,7 @@ func (m *TaskViewModel) loadAllPending() tea.Msg {
 		return nil
 	}
 
-	m.storage.ResetTodayList()
+	m.storage.ResetTodayListLocked()
 
 	var uncompleted, completed []TaskItem
 	for _, listName := range lists {

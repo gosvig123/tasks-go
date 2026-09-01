@@ -130,22 +130,43 @@ func (c *Client) Sync(tasksDir string) (*Gist, error) {
 		return nil, err
 	}
 
+	files, err := c.syncedFiles(tasksDir)
+	if err != nil {
+		return nil, err
+	}
+	gist := &Gist{Description: "Tasks Backup - tasks-go", Files: files}
+	return c.updateOrGitSync(gist, files)
+}
+
+func (c *Client) syncedFiles(tasksDir string) (map[string]GistFile, error) {
 	files, err := c.readTaskFiles(tasksDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read task files: %w", err)
 	}
-
-	// Add sync timestamp
 	files["_last-sync.md"] = GistFile{
 		Content: fmt.Sprintf("Last synced: %s\n", time.Now().Format("2006-01-02 15:04:05")),
 	}
+	return files, nil
+}
 
-	gist := &Gist{
-		Description: "Tasks Backup - tasks-go",
-		Files:       files,
+func (c *Client) updateOrGitSync(gist *Gist, files map[string]GistFile) (*Gist, error) {
+	updated, err := c.updateGist(gist)
+	if err == nil {
+		return updated, nil
 	}
+	if syncErr := c.syncWithGit(files); syncErr != nil {
+		return nil, fmt.Errorf("gist API sync failed: %w; git fallback failed: %v", err, syncErr)
+	}
+	return c.getGist()
+}
 
-	return c.updateGist(gist)
+// UpdateToken replaces the stored GitHub token without changing the gist.
+func (c *Client) UpdateToken(token string) error {
+	if err := c.LoadConfig(); err != nil {
+		return err
+	}
+	c.config.Token = token
+	return c.SaveConfig(c.config)
 }
 
 // Status returns the current sync status
